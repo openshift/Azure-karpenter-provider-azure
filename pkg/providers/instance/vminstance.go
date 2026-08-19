@@ -18,6 +18,7 @@ package instance
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -91,6 +92,10 @@ const (
 	// TODO: Why bother with a different CSE name for Windows?
 	cseNameWindows = "windows-cse-agent-karpenter"
 	cseNameLinux   = "cse-agent-karpenter"
+	// openShiftDummySSHPublicKey satisfies Azure VM OSProfile SSH requirements.
+	// OpenShift node access comes from Ignition, not this key.
+	// See https://github.com/openshift/hypershift/blob/main/hypershift-operator/controllers/nodepool/azure.go#L24-L25
+	openShiftDummySSHPublicKey = "c3NoLXJzYSBBQUFBQjNOemFDMXljMkVBQUFBREFRQUJBQUFCQVFDTGFjOTR4dUE4QjkyMEtjejhKNjhUdmZCRjQyR2UwUllXSUx3Lzd6dDhUQlU5ell5Q0Q2K0ZlekFwWndLRjB1V3luMGVBQmlBWVdIV0tKbENxS0VIT2hOQmV2Mkx3S0dnZHFqM0dvcHV2N3RpZFVqSVpqYi9DVWtjQVRZUWhMWkxVTCs3eWkzRThKNHdhYkxEMWVNS1p1U3ZmMUsxT0RwVUFXYTkwbWVmR0FBOVdIVEhMcnF1UUpWdC9JT0JKN1ROZFNwMDVuM0Ywa29xZlE2empwRlFYMk8zaWJUc29yR3ZEekdhYS9yUENxQWhTSjRJaEhnMDNVb3FBbVlraW51NTFvVEcxRlRXaTh2b00vRVJ4TlduamNUSElET1JmYmo2bFVyZ3Zkci9MZGtqc2dFcENiNEMxUS9IbW5MRHVpTEdPM2tNZ2cyOHFzZ0ZmTHloUjl3ay8K"
 )
 
 // ErrorCodeForMetrics extracts a stable Azure error code for metric labeling when possible.
@@ -112,7 +117,7 @@ func ErrorCodeForMetrics(err error) string {
 func GetManagedExtensionNames(provisionMode string, env *auth.Environment) []string {
 	var result []string
 	// Only including AKS identifying extension in the clouds it is supported in
-	if isAKSIdentifyingExtensionEnabled(env) {
+	if isAKSIdentifyingExtensionEnabled(env) && provisionMode != consts.ProvisionModeOpenShift {
 		result = append(result, aksIdentifyingExtensionName)
 	}
 	if provisionMode == consts.ProvisionModeBootstrappingClient {
@@ -559,6 +564,11 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 		return &armcompute.VirtualMachine{} // TODO(Windows)
 	}
 
+	sshPublicKey := opts.SSHPublicKey
+	if opts.ProvisionMode == consts.ProvisionModeOpenShift {
+		sshPublicKey = openShiftDummySSHPublicKey
+	}
+
 	vm := &armcompute.VirtualMachine{
 		Name:     lo.ToPtr(opts.VMName), // TODO: I think it's safe to set this, even though it's read only
 		Location: lo.ToPtr(opts.Location),
@@ -597,7 +607,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 					SSH: &armcompute.SSHConfiguration{
 						PublicKeys: []*armcompute.SSHPublicKey{
 							{
-								KeyData: lo.ToPtr(opts.SSHPublicKey),
+								KeyData: lo.ToPtr(sshPublicKey),
 								Path:    lo.ToPtr("/home/" + opts.LinuxAdminUsername + "/.ssh/authorized_keys"),
 							},
 						},
@@ -611,12 +621,24 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	}
 	setVMPropertiesOSDiskType(vm.Properties, opts.LaunchTemplate)
 	setVMPropertiesOSDiskEncryption(vm.Properties, opts.DiskEncryptionSetID)
-	setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
+	if opts.LaunchTemplate.MarketplaceImage != nil {
+		m := opts.LaunchTemplate.MarketplaceImage
+		vm.Properties.StorageProfile.ImageReference = &armcompute.ImageReference{
+			Publisher: lo.ToPtr(m.Publisher),
+			Offer:     lo.ToPtr(m.Offer),
+			SKU:       lo.ToPtr(m.SKU),
+			Version:   lo.ToPtr(m.Version),
+		}
+	} else {
+		setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
+	}
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
 
 	if opts.ProvisionMode == consts.ProvisionModeBootstrappingClient {
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(opts.LaunchTemplate.CustomScriptsCustomData)
+	} else if opts.ProvisionMode == consts.ProvisionModeOpenShift {
+		vm.Properties.OSProfile.CustomData = lo.ToPtr(base64.StdEncoding.EncodeToString([]byte(opts.LaunchTemplate.OpenShiftUserData)))
 	} else {
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(opts.LaunchTemplate.ScriptlessCustomData)
 	}
@@ -774,7 +796,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		return nil, fmt.Errorf("checking if vnet is managed: %w", err)
 	}
 	var nsgID string
-	if !isAKSManagedVNET {
+	if p.provisionMode != consts.ProvisionModeOpenShift && !isAKSManagedVNET {
 		nsg, err := p.networkSecurityGroupProvider.ManagedNetworkSecurityGroup(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("getting managed network security group: %w", err)
@@ -886,7 +908,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 					return err
 				}
 			}
-			if isAKSIdentifyingExtensionEnabled(p.env) {
+			if isAKSIdentifyingExtensionEnabled(p.env) && p.provisionMode != consts.ProvisionModeOpenShift {
 				err = p.createAKSIdentifyingExtension(ctx, resourceName, launchTemplate.Tags)
 				if err != nil {
 					return err

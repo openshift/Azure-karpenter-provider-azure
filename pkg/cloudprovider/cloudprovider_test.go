@@ -23,12 +23,145 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
+	opstatus "github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestValidateNodeClassOpenShift(t *testing.T) {
+	openShiftCtx := test.Options(test.OptionsFields{
+		ProvisionMode: lo.ToPtr(consts.ProvisionModeOpenShift),
+	}).ToContext(context.Background())
+
+	validNodeClass := func() *v1beta1.AKSNodeClass {
+		nc := test.AKSNodeClass(v1beta1.AKSNodeClass{
+			Spec: v1beta1.AKSNodeClassSpec{
+				MarketplaceImage: &v1beta1.MarketplaceImage{
+					Publisher: "azureopenshift",
+					Offer:     "aro4",
+					SKU:       "aro_422-v2",
+					Version:   "9.8.20260428",
+				},
+				UserData: lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
+			},
+		})
+		nc.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)
+		return nc
+	}
+
+	tests := []struct {
+		name      string
+		ctx       context.Context
+		nodeClass *v1beta1.AKSNodeClass
+		expectErr bool
+		errMsg    string
+	}{
+		{
+			name:      "OpenShift mode accepts marketplaceImage and userData without AKS readiness",
+			ctx:       openShiftCtx,
+			nodeClass: validNodeClass(),
+			expectErr: false,
+		},
+		{
+			name: "OpenShift mode skips aggregate Ready but still requires platform conditions",
+			ctx:  openShiftCtx,
+			nodeClass: func() *v1beta1.AKSNodeClass {
+				nc := validNodeClass()
+				nc.StatusConditions().SetFalse(opstatus.ConditionReady, "NotReady", "kubernetes version not ready")
+				return nc
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "OpenShift mode requires SubnetsReady",
+			ctx:  openShiftCtx,
+			nodeClass: func() *v1beta1.AKSNodeClass {
+				nc := validNodeClass()
+				nc.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, "SubnetNotFound", "subnet missing")
+				return nc
+			}(),
+			expectErr: true,
+			errMsg:    "subnet missing",
+		},
+		{
+			name: "OpenShift mode waits for unresolved SubnetsReady",
+			ctx:  openShiftCtx,
+			nodeClass: func() *v1beta1.AKSNodeClass {
+				nc := validNodeClass()
+				nc.StatusConditions().SetUnknownWithReason(v1beta1.ConditionTypeSubnetsReady, "Reconciling", "checking subnet")
+				return nc
+			}(),
+			expectErr: true,
+			errMsg:    "SubnetsReady is in Ready=Unknown",
+		},
+		{
+			name: "OpenShift mode requires marketplaceImage",
+			ctx:  openShiftCtx,
+			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
+				Spec: v1beta1.AKSNodeClassSpec{
+					UserData: lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
+				},
+			}),
+			expectErr: true,
+			errMsg:    "marketplaceImage is required in OpenShift mode",
+		},
+		{
+			name: "OpenShift mode requires userData",
+			ctx:  openShiftCtx,
+			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
+				Spec: v1beta1.AKSNodeClassSpec{
+					MarketplaceImage: &v1beta1.MarketplaceImage{
+						Publisher: "azureopenshift",
+						Offer:     "aro4",
+						SKU:       "aro_422-v2",
+						Version:   "9.8.20260428",
+					},
+				},
+			}),
+			expectErr: true,
+			errMsg:    "userData is required in OpenShift mode",
+		},
+		{
+			name: "OpenShift mode rejects empty userData",
+			ctx:  openShiftCtx,
+			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
+				Spec: v1beta1.AKSNodeClassSpec{
+					MarketplaceImage: &v1beta1.MarketplaceImage{
+						Publisher: "azureopenshift",
+						Offer:     "aro4",
+						SKU:       "aro_422-v2",
+						Version:   "9.8.20260428",
+					},
+					UserData: lo.ToPtr(""),
+				},
+			}),
+			expectErr: true,
+			errMsg:    "userData is required in OpenShift mode",
+		},
+	}
+
+	cp := &CloudProvider{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			err := cp.validateNodeClass(tt.ctx, tt.nodeClass)
+			if tt.expectErr {
+				g.Expect(err).To(HaveOccurred())
+				if tt.errMsg != "" {
+					g.Expect(err.Error()).To(ContainSubstring(tt.errMsg))
+				}
+				return
+			}
+			g.Expect(err).ToNot(HaveOccurred())
+		})
+	}
+}
 
 func TestGenerateNodeClaimName(t *testing.T) {
 	tests := []struct {

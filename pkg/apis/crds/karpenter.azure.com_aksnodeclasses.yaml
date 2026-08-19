@@ -1622,6 +1622,34 @@ spec:
                 - mode
                 - vnetDNSOverrides
                 type: object
+              marketplaceImage:
+                description: |-
+                  marketplaceImage selects an Azure Marketplace platform image by publisher/offer/sku/version.
+                  For OpenShift mode, use this for ARO RHCOS images (e.g. azureopenshift/aro4/aro_422-v2/...).
+                properties:
+                  offer:
+                    description: offer is the product line of the image.
+                    type: string
+                  publisher:
+                    description: publisher is the name of the organization that published
+                      the image.
+                    type: string
+                  sku:
+                    description: sku is the specific image flavor.
+                    type: string
+                  version:
+                    description: version is the image build version.
+                    type: string
+                required:
+                - offer
+                - publisher
+                - sku
+                - version
+                type: object
+                x-kubernetes-validations:
+                - message: publisher, offer, sku and version must all be set
+                  rule: self.publisher != '' && self.offer != '' && self.sku != ''
+                    && self.version != ''
               maxPods:
                 description: |-
                   maxPods is an override for the maximum number of pods that can run on a worker node instance.
@@ -1668,6 +1696,13 @@ spec:
                   rule: self.all(k, !k.contains('\\'))
                 - message: tags values must be less than 256 characters
                   rule: self.all(k, size(self[k]) <= 256)
+              userData:
+                description: |-
+                  userData is the raw bootstrap payload (e.g. Ignition config for OpenShift) passed as CustomData to the VM.
+                  The provider base64-encodes this internally — provide raw text, not pre-encoded.
+                  When specified in OpenShift mode, this bypasses the default AKS bootstrap script generation.
+                maxLength: 65536
+                type: string
               vnetSubnetID:
                 description: |-
                   vnetSubnetID is the subnet used by nics provisioned with this nodeclass.

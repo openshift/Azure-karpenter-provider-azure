@@ -182,6 +182,31 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 			nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
 		})
 
+		Context("Marketplace image", func() {
+			var imageReconciler *status.NodeImageReconciler
+
+			BeforeEach(func() {
+				imageReconciler = status.NewNodeImageReconciler(azureEnv.ImageProvider, env.KubernetesInterface)
+			})
+
+			It("should set status from spec and skip gallery resolution", func() {
+				nodeClass.Spec.MarketplaceImage = &v1beta1.MarketplaceImage{
+					Publisher: "azureopenshift",
+					Offer:     "aro4",
+					SKU:       "aro_422-v2",
+					Version:   "9.8.20260428",
+				}
+
+				result, err := imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+				Expect(nodeClass.Status.Images).To(HaveLen(1))
+				Expect(nodeClass.Status.Images[0].ID).To(Equal("azureopenshift:aro4:aro_422-v2:9.8.20260428"))
+				Expect(nodeClass.Status.Images[0].Requirements).To(BeEmpty())
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+			})
+		})
+
 		Context("FIPS Validation With UseSIG", func() {
 			var (
 				imageReconciler *status.NodeImageReconciler
