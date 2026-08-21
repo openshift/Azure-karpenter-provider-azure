@@ -43,6 +43,7 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 
@@ -114,7 +115,18 @@ func (c *CloudProvider) WaitForInstancePromises() {
 	c.instancePromiseWg.Wait()
 }
 
-func (c *CloudProvider) validateNodeClass(nodeClass *v1beta1.AKSNodeClass) error {
+func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
+	// In OpenShift mode, skip AKS-specific validation (k8s version, images from status)
+	// as these are handled differently (marketplaceImage and userData come directly from spec)
+	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
+		if !nodeClass.HasMarketplaceImage() {
+			return cloudprovider.NewNodeClassNotReadyError(stderrors.New("marketplaceImage is required in OpenShift mode"))
+		}
+		if nodeClass.Spec.UserData == nil || *nodeClass.Spec.UserData == "" {
+			return cloudprovider.NewNodeClassNotReadyError(stderrors.New("userData is required in OpenShift mode"))
+		}
+		return nil
+	}
 	nodeClassReady := nodeClass.StatusConditions().Get(status.ConditionReady)
 	if nodeClassReady.IsFalse() {
 		return cloudprovider.NewNodeClassNotReadyError(stderrors.New(nodeClassReady.Message))
@@ -152,7 +164,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			return nil, err
 		}
 	*/
-	if err = c.validateNodeClass(nodeClass); err != nil {
+	if err = c.validateNodeClass(ctx, nodeClass); err != nil {
 		return nil, err
 	}
 
