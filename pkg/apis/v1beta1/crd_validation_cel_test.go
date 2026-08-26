@@ -1418,4 +1418,60 @@ var _ = Describe("CEL/Validation", func() {
 			Expect(env.Client.Create(ctx, nodeClass)).To(Succeed())
 		})
 	})
+
+	Context("MarketplaceImage", func() {
+		It("should accept a complete marketplace image", func() {
+			nodeClass := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec: v1beta1.AKSNodeClassSpec{
+					MarketplaceImage: &v1beta1.MarketplaceImage{
+						Publisher: "azureopenshift",
+						Offer:     "aro4",
+						SKU:       "aro_422-v2",
+						Version:   "9.8.20260428",
+					},
+				},
+			}
+			Expect(env.Client.Create(ctx, nodeClass)).To(Succeed())
+		})
+
+		It("should reject marketplace image with an empty publisher", func() {
+			nodeClass := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec: v1beta1.AKSNodeClassSpec{
+					MarketplaceImage: &v1beta1.MarketplaceImage{
+						Publisher: "",
+						Offer:     "aro4",
+						SKU:       "aro_422-v2",
+						Version:   "9.8.20260428",
+					},
+				},
+			}
+			err := env.Client.Create(ctx, nodeClass)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("publisher, offer, sku and version must all be set"))
+		})
+	})
+
+	Context("UserData", func() {
+		It("should accept userData within max length", func() {
+			nodeClass := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec: v1beta1.AKSNodeClassSpec{
+					UserData: lo.ToPtr(`{"ignition":{"version":"3.2.0"}}`),
+				},
+			}
+			Expect(env.Client.Create(ctx, nodeClass)).To(Succeed())
+		})
+
+		It("should reject userData above max length", func() {
+			nodeClass := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec: v1beta1.AKSNodeClassSpec{
+					UserData: lo.ToPtr(strings.Repeat("a", 65537)),
+				},
+			}
+			Expect(env.Client.Create(ctx, nodeClass)).ToNot(Succeed())
+		})
+	})
 })

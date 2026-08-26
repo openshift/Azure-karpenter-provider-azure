@@ -25,4 +25,4 @@ coverage.html
 karpenter-values.yaml
 
 ## Binary
-./bin
+bin/

@@ -92,6 +92,12 @@ func TestGetManagedExtensionNames(t *testing.T) {
 			env:           noBillingExtensionEnv,
 			expected:      nil,
 		},
+		{
+			name:          "PublicCloud with OpenShift mode returns no extensions",
+			provisionMode: consts.ProvisionModeOpenShift,
+			env:           publicCloudEnv,
+			expected:      nil,
+		},
 	}
 
 	for _, tt := range tests {
