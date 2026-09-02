@@ -624,10 +624,10 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	if opts.LaunchTemplate.MarketplaceImage != nil {
 		m := opts.LaunchTemplate.MarketplaceImage
 		vm.Properties.StorageProfile.ImageReference = &armcompute.ImageReference{
-			Publisher: lo.ToPtr(m.Publisher),
-			Offer:     lo.ToPtr(m.Offer),
-			SKU:       lo.ToPtr(m.SKU),
-			Version:   lo.ToPtr(m.Version),
+			Publisher: m.Publisher,
+			Offer:     m.Offer,
+			SKU:       m.SKU,
+			Version:   m.Version,
 		}
 	} else {
 		setImageReference(vm.Properties, opts.LaunchTemplate.ImageID, opts.UseSIG)
@@ -635,11 +635,12 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
 
-	if opts.ProvisionMode == consts.ProvisionModeBootstrappingClient {
+	switch opts.ProvisionMode {
+	case consts.ProvisionModeBootstrappingClient:
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(opts.LaunchTemplate.CustomScriptsCustomData)
-	} else if opts.ProvisionMode == consts.ProvisionModeOpenShift {
+	case consts.ProvisionModeOpenShift:
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(base64.StdEncoding.EncodeToString([]byte(opts.LaunchTemplate.OpenShiftUserData)))
-	} else {
+	default:
 		vm.Properties.OSProfile.CustomData = lo.ToPtr(opts.LaunchTemplate.ScriptlessCustomData)
 	}
 

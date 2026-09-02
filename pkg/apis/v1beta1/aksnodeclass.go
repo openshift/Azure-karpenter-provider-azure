@@ -156,20 +156,20 @@ type Security struct {
 }
 
 // MarketplaceImage selects an Azure Marketplace platform image.
-// +kubebuilder:validation:XValidation:message="publisher, offer, sku and version must all be set",rule="self.publisher != '' && self.offer != '' && self.sku != '' && self.version != ''"
+// +kubebuilder:validation:XValidation:message="publisher, offer, sku and version must all be set",rule="has(self.publisher) && has(self.offer) && has(self.sku) && has(self.version) && self.publisher != ” && self.offer != ” && self.sku != ” && self.version != ”"
 type MarketplaceImage struct {
 	// publisher is the name of the organization that published the image.
 	// +required
-	Publisher string `json:"publisher"`
+	Publisher *string `json:"publisher,omitempty"`
 	// offer is the product line of the image.
 	// +required
-	Offer string `json:"offer"`
+	Offer *string `json:"offer,omitempty"`
 	// sku is the specific image flavor.
 	// +required
-	SKU string `json:"sku"`
+	SKU *string `json:"sku,omitempty"`
 	// version is the image build version.
 	// +required
-	Version string `json:"version"`
+	Version *string `json:"version,omitempty"`
 }
 
 // +kubebuilder:validation:Enum:={Preferred,Required,Disabled}
@@ -752,7 +752,10 @@ func (in *AKSNodeClass) HasMarketplaceImage() bool {
 		return false
 	}
 	m := in.Spec.MarketplaceImage
-	return m.Publisher != "" && m.Offer != "" && m.SKU != "" && m.Version != ""
+	return m.Publisher != nil && *m.Publisher != "" &&
+		m.Offer != nil && *m.Offer != "" &&
+		m.SKU != nil && *m.SKU != "" &&
+		m.Version != nil && *m.Version != ""
 }
 
 // MarketplaceImageURN returns the standard Publisher:Offer:Sku:Version representation.
@@ -761,7 +764,7 @@ func (in *AKSNodeClass) MarketplaceImageURN() string {
 		return ""
 	}
 	m := in.Spec.MarketplaceImage
-	return fmt.Sprintf("%s:%s:%s:%s", m.Publisher, m.Offer, m.SKU, m.Version)
+	return fmt.Sprintf("%s:%s:%s:%s", *m.Publisher, *m.Offer, *m.SKU, *m.Version)
 }
 
 // IsArtifactStreamingEnabled returns whether artifact streaming should be enabled for this node class.

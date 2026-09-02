@@ -21,6 +21,10 @@ TEST_TIMEOUT ?= "3h"
 # LABEL_FILTER enables filtering tests by Ginkgo labels (e.g., LABEL_FILTER="runner" or LABEL_FILTER="!runner")
 LABEL_FILTER ?=
 
+PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
+GOLANGCI_LINT = go run ${PROJECT_DIR}/vendor/github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+GINKGO = go run ${PROJECT_DIR}/vendor/github.com/onsi/ginkgo/v2/ginkgo
+
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
@@ -34,7 +38,7 @@ ci-test: test coverage ## Runs tests and submits coverage
 ci-non-test: verify licenses vulncheck ## Runs checks other than tests
 
 test: ## Run tests
-	ginkgo -vv \
+	$(GINKGO) -vv \
 		-cover -coverprofile=coverage.out -output-dir=. -coverpkg=./pkg/... \
 		--focus="${FOCUS}" \
 		--randomize-all \
@@ -151,7 +155,20 @@ tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
 download: ## Recursively "go mod download" on all directories where go.mod exists
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
 
-.PHONY: help build presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download
+lint-setup-custom:
+	@if [ ! -f "$(shell go env GOPATH)/bin/golangci-lint-custom" ]; then \
+		echo "Building custom golangci-lint from vendored sources..."; \
+		TOOL_DEST=$(shell go env GOPATH)/bin envsubst < hack/custom-gcl.template.yml > .custom-gcl.yml && \
+		go run ${PROJECT_DIR}/vendor/github.com/golangci/golangci-lint/v2/cmd/golangci-lint custom -v && \
+		rm .custom-gcl.yml; \
+	fi
+
+
+lint: lint-setup-custom ## Go lint your code
+	( GOLANGCI_LINT_CACHE=$(PROJECT_DIR)/.cache golangci-lint-custom run --timeout 10m )
+
+
+.PHONY: help build presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download lint lint-setup-custom
 
 define newline
 

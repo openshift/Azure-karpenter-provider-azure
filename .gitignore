@@ -26,3 +26,6 @@ karpenter-values.yaml
 
 ## Binary
 bin/
+
+## Golangci-lint cache
+.cache
