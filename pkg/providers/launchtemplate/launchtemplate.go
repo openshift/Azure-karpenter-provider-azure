@@ -224,6 +224,8 @@ func getAgentbakerNetworkPlugin(ctx context.Context) string {
 
 // getOpenShiftTemplate creates a simplified template for OpenShift mode.
 // It uses marketplaceImage and userData directly from the nodeClass, bypassing AKS-specific bootstrap.
+//
+//nolint:unparam
 func (p *Provider) getOpenShiftTemplate(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (*Template, error) {
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
 

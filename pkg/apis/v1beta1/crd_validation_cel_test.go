@@ -1425,10 +1425,10 @@ var _ = Describe("CEL/Validation", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
 				Spec: v1beta1.AKSNodeClassSpec{
 					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "azureopenshift",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
+						Publisher: lo.ToPtr("azureopenshift"),
+						Offer:     lo.ToPtr("aro4"),
+						SKU:       lo.ToPtr("aro_422-v2"),
+						Version:   lo.ToPtr("9.8.20260428"),
 					},
 				},
 			}
@@ -1440,10 +1440,10 @@ var _ = Describe("CEL/Validation", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
 				Spec: v1beta1.AKSNodeClassSpec{
 					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
+						Publisher: lo.ToPtr(""),
+						Offer:     lo.ToPtr("aro4"),
+						SKU:       lo.ToPtr("aro_422-v2"),
+						Version:   lo.ToPtr("9.8.20260428"),
 					},
 				},
 			}

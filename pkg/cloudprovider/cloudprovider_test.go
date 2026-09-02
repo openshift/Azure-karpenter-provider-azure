@@ -42,10 +42,10 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 		nc := test.AKSNodeClass(v1beta1.AKSNodeClass{
 			Spec: v1beta1.AKSNodeClassSpec{
 				MarketplaceImage: &v1beta1.MarketplaceImage{
-					Publisher: "azureopenshift",
-					Offer:     "aro4",
-					SKU:       "aro_422-v2",
-					Version:   "9.8.20260428",
+					Publisher: lo.ToPtr("azureopenshift"),
+					Offer:     lo.ToPtr("aro4"),
+					SKU:       lo.ToPtr("aro_422-v2"),
+					Version:   lo.ToPtr("9.8.20260428"),
 				},
 				UserData: lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
 			},
@@ -116,10 +116,10 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
 					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "azureopenshift",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
+						Publisher: lo.ToPtr("azureopenshift"),
+						Offer:     lo.ToPtr("aro4"),
+						SKU:       lo.ToPtr("aro_422-v2"),
+						Version:   lo.ToPtr("9.8.20260428"),
 					},
 				},
 			}),
@@ -132,10 +132,10 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
 					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "azureopenshift",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
+						Publisher: lo.ToPtr("azureopenshift"),
+						Offer:     lo.ToPtr("aro4"),
+						SKU:       lo.ToPtr("aro_422-v2"),
+						Version:   lo.ToPtr("9.8.20260428"),
 					},
 					UserData: lo.ToPtr(""),
 				},

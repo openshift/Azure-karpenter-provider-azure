@@ -21,6 +21,7 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 )
 
 func TestHasMarketplaceImage(t *testing.T) {
@@ -37,29 +38,29 @@ func TestHasMarketplaceImage(t *testing.T) {
 		{
 			name: "complete marketplace image",
 			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-				Version:   "9.8.20260428",
+				Publisher: lo.ToPtr("azureopenshift"),
+				Offer:     lo.ToPtr("aro4"),
+				SKU:       lo.ToPtr("aro_422-v2"),
+				Version:   lo.ToPtr("9.8.20260428"),
 			},
 			expected: true,
 		},
 		{
 			name: "missing version",
 			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
+				Publisher: lo.ToPtr("azureopenshift"),
+				Offer:     lo.ToPtr("aro4"),
+				SKU:       lo.ToPtr("aro_422-v2"),
 			},
 			expected: false,
 		},
 		{
 			name: "empty publisher",
 			image: &v1beta1.MarketplaceImage{
-				Publisher: "",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-				Version:   "9.8.20260428",
+				Publisher: lo.ToPtr(""),
+				Offer:     lo.ToPtr("aro4"),
+				SKU:       lo.ToPtr("aro_422-v2"),
+				Version:   lo.ToPtr("9.8.20260428"),
 			},
 			expected: false,
 		},
@@ -92,19 +93,19 @@ func TestMarketplaceImageURN(t *testing.T) {
 		{
 			name: "complete marketplace image",
 			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-				Version:   "9.8.20260428",
+				Publisher: lo.ToPtr("azureopenshift"),
+				Offer:     lo.ToPtr("aro4"),
+				SKU:       lo.ToPtr("aro_422-v2"),
+				Version:   lo.ToPtr("9.8.20260428"),
 			},
 			expected: "azureopenshift:aro4:aro_422-v2:9.8.20260428",
 		},
 		{
 			name: "incomplete marketplace image",
 			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
+				Publisher: lo.ToPtr("azureopenshift"),
+				Offer:     lo.ToPtr("aro4"),
+				SKU:       lo.ToPtr("aro_422-v2"),
 			},
 			expected: "",
 		},

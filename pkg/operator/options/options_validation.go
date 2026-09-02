@@ -117,6 +117,7 @@ func (o *Options) validateVMMemoryOverheadPercent() error {
 	return nil
 }
 
+//nolint:gocyclo
 func (o *Options) validateProvisionMode() error {
 	if o.ProvisionMode != consts.ProvisionModeAKSScriptless && o.ProvisionMode != consts.ProvisionModeBootstrappingClient && o.ProvisionMode != consts.ProvisionModeOpenShift && !o.IsAKSMachineAPIMode() {
 		return fmt.Errorf("provision-mode is invalid: %s", o.ProvisionMode)

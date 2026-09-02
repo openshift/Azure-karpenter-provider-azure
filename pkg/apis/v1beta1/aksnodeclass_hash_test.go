@@ -100,10 +100,10 @@ var _ = Describe("Hash", func() {
 		Entry("LocalDNS.VnetDNSOverrides.ServeStaleDuration", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{LocalDNS: &v1beta1.LocalDNS{VnetDNSOverrides: []v1beta1.LocalDNSZoneOverride{{Zone: "example.com", ServeStaleDuration: karpv1.MustParseNillableDuration("1h")}}}}}),
 		Entry("ArtifactStreaming.Enabled", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ArtifactStreaming: &v1beta1.ArtifactStreaming{Enabled: lo.ToPtr(true)}}}),
 		Entry("MarketplaceImage", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{MarketplaceImage: &v1beta1.MarketplaceImage{
-			Publisher: "azureopenshift",
-			Offer:     "aro4",
-			SKU:       "aro_422-v2",
-			Version:   "9.8.20260428",
+			Publisher: lo.ToPtr("azureopenshift"),
+			Offer:     lo.ToPtr("aro4"),
+			SKU:       lo.ToPtr("aro_422-v2"),
+			Version:   lo.ToPtr("9.8.20260428"),
 		}}}),
 		Entry("UserData", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{UserData: lo.ToPtr(`{"ignition":{"version":"3.2.0"}}`)}}),
 	)
