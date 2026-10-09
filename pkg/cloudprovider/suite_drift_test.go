@@ -259,6 +259,24 @@ var _ = Describe("CloudProvider", func() {
 					Expect(err).ToNot(HaveOccurred())
 					Expect(drifted).To(Equal(K8sVersionDrift))
 				})
+
+				It("should succeed with no drift in OpenShift mode when KubernetesVersion is new", func() {
+					ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+						ProvisionMode:           lo.ToPtr(consts.ProvisionModeOpenShift),
+						KubeletIdentityClientID: lo.ToPtr(node.Labels[v1beta1.AKSLabelKubeletIdentityClientID]),
+					}))
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+					semverCurrentK8sVersion := lo.Must(semver.ParseTolerant(*nodeClass.Status.KubernetesVersion))
+					semverCurrentK8sVersion.Minor = semverCurrentK8sVersion.Minor + 1
+					nodeClass.Status.KubernetesVersion = lo.ToPtr(semverCurrentK8sVersion.String())
+
+					ExpectApplied(ctx, env.Client, nodeClass)
+
+					drifted, err := cloudProvider.IsDrifted(ctx, driftNodeClaim)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(drifted).To(Equal(NoDrift))
+				})
 			})
 
 			Context("Kubelet Client ID", func() {

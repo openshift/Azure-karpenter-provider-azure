@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
@@ -116,6 +117,12 @@ func (c *CloudProvider) areStaticFieldsDrifted(ctx context.Context, nodeClaim *k
 
 func (c *CloudProvider) isK8sVersionDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
 	logger := log.FromContext(ctx)
+
+	// OpenShift nodes get their release from spec.marketplaceImage and spec.userData, which are part of the
+	// NodeClass hash. A kubelet version that differs from the control plane's is expected and is not drift.
+	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
+		return "", nil
+	}
 
 	k8sVersion, err := nodeClass.GetKubernetesVersion()
 	// Note: this differs from AWS, as they don't check for status readiness during Drift.
