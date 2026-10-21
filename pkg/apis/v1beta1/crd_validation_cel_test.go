@@ -915,6 +915,42 @@ var _ = Describe("CEL/Validation", func() {
 		)
 	})
 
+	Context("MaxPods", func() {
+		DescribeTable("should accept maxPods without Azure-specific bounds", func(maxPods *int32) {
+			nodeClass := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec: v1beta1.AKSNodeClassSpec{
+					MaxPods: maxPods,
+				},
+			}
+			Expect(env.Client.Create(ctx, nodeClass)).To(Succeed())
+		},
+			Entry("below the former minimum (9)", lo.ToPtr(int32(9))),
+			Entry("at the former minimum (10)", lo.ToPtr(int32(10))),
+			Entry("at the former maximum (250)", lo.ToPtr(int32(250))),
+			Entry("above the former maximum (251)", lo.ToPtr(int32(251))),
+			Entry("omitted", nil),
+		)
+
+		DescribeTable("should reject non-integer maxPods", func(maxPods interface{}) {
+			nodeClass := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "karpenter.azure.com/v1beta1",
+				"kind":       "AKSNodeClass",
+				"metadata": map[string]interface{}{
+					"name": strings.ToLower(randomdata.SillyName()),
+				},
+				"spec": map[string]interface{}{"maxPods": maxPods},
+			}}
+			Expect(env.Client.Create(ctx, nodeClass)).To(MatchError(And(
+				ContainSubstring("spec.maxPods"),
+				ContainSubstring("must be of type integer"),
+			)))
+		},
+			Entry("string", "10"),
+			Entry("fractional number", 10.5),
+		)
+	})
+
 	Context("OSDiskSizeGB", func() {
 		DescribeTable("Should validate OSDiskSizeGB constraints", func(osDiskSizeGB *int32, expected bool) {
 			nodeClass := &v1beta1.AKSNodeClass{
