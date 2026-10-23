@@ -117,8 +117,6 @@ type AKSNodeClassSpec struct {
 	//   - If Network Plugin is None, the default is 250.
 	//   - Otherwise, the default is 110 (the usual Kubernetes default).
 	//
-	// +kubebuilder:validation:Minimum:=10
-	// +kubebuilder:validation:Maximum:=250
 	// +optional
 	MaxPods *int32 `json:"maxPods,omitempty"`
 
