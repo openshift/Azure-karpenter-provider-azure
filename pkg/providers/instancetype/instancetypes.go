@@ -140,7 +140,7 @@ func (p *DefaultProvider) List(
 	instanceTypeParams := &instanceTypeParameters{
 		ImageFamily:              lo.FromPtr(nodeClass.Spec.ImageFamily),
 		OSDiskSizeGB:             lo.FromPtr(nodeClass.Spec.OSDiskSizeGB),
-		MaxPods:                  utils.GetMaxPods(nodeClass, options.FromContext(ctx).NetworkPlugin, options.FromContext(ctx).NetworkPluginMode),
+		MaxPods:                  openShiftMaxPods(nodeClass, options.FromContext(ctx).ProvisionMode, options.FromContext(ctx).NetworkPlugin, options.FromContext(ctx).NetworkPluginMode),
 		EncryptionAtHost:         nodeClass.GetEncryptionAtHost(),
 		GPUMode:                  nodeClass.GetGPUMode(),
 		ArtifactStreamingEnabled: nodeClass.IsArtifactStreamingExplicitlyEnabled(),
