@@ -17,8 +17,10 @@ limitations under the License.
 package imagefamily_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
@@ -28,7 +30,9 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
@@ -78,6 +82,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 	var (
 		testOptions               *options.Options
 		communityImageVersionsAPI *fake.CommunityGalleryImageVersionsAPI
+		marketplaceImagesAPI      *fake.VirtualMachineImagesAPI
 
 		nodeImageProvider imagefamily.NodeImageProvider
 		nodeClass         *v1beta1.AKSNodeClass
@@ -93,11 +98,150 @@ var _ = Describe("NodeImageProvider tests", func() {
 		cigImageVersionTest := cigImageVersion
 		communityImageVersionsAPI.ImageVersions.Append(&armcompute.CommunityGalleryImageVersion{Name: &cigImageVersionTest})
 		nodeImageVersionsAPI := &fake.NodeImageVersionsAPI{}
-		nodeImageProvider = imagefamily.NewProvider(communityImageVersionsAPI, fake.Region, customerSubscription, nodeImageVersionsAPI, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
+		marketplaceImagesAPI = &fake.VirtualMachineImagesAPI{}
+		nodeImageProvider = imagefamily.NewProvider(communityImageVersionsAPI, marketplaceImagesAPI, fake.Region, customerSubscription, nodeImageVersionsAPI, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
 		kubernetesVersion = lo.Must(env.KubernetesInterface.Discovery().ServerVersion()).String()
 
 		nodeClass = test.AKSNodeClass()
 		test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
+	})
+
+	Context("MarketplaceImages", func() {
+		BeforeEach(func() {
+			nodeClass.Spec.MarketplaceImages = []string{"publisher:offer:amd64:1.0.0", "publisher:offer:arm64:1.0.0"}
+			nodeClass.Status.KubernetesVersion = nil
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeKubernetesVersionReady, "Unavailable", "not AKS")
+			nodeClass.Spec.FIPSMode = &v1beta1.FIPSModeFIPS
+		})
+		It("resolves both architectures in order without AKS or gallery prerequisites", func() {
+			var requests [][]string
+			marketplaceImagesAPI.GetFunc = func(_ context.Context, location, publisher, offer, sku, version string, _ *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+				requests = append(requests, []string{location, publisher, offer, sku, version})
+				arch := armcompute.ArchitectureTypesX64
+				generation := armcompute.HyperVGenerationTypesV1
+				if sku == "arm64" {
+					arch = armcompute.ArchitectureTypesArm64
+					generation = armcompute.HyperVGenerationTypesV2
+				}
+				return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{
+					Properties: &armcompute.VirtualMachineImageProperties{Architecture: &arch, HyperVGeneration: &generation},
+				}}, nil
+			}
+			// Nil gallery clients prove marketplace resolution does not consult them.
+			provider := imagefamily.NewProvider(nil, marketplaceImagesAPI, fake.Region, customerSubscription, nil, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
+			images, err := provider.List(ctx, nodeClass)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requests).To(Equal([][]string{
+				{fake.Region, "publisher", "offer", "amd64", "1.0.0"},
+				{fake.Region, "publisher", "offer", "arm64", "1.0.0"},
+			}))
+			Expect(images).To(Equal([]imagefamily.NodeImage{
+				{ID: "publisher:offer:amd64:1.0.0", Requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+					scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, corev1.NodeSelectorOpIn, "1"),
+				)},
+				{ID: "publisher:offer:arm64:1.0.0", Requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "arm64"),
+					scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, corev1.NodeSelectorOpIn, "2"),
+				)},
+			}))
+		})
+		DescribeTable("fails closed on invalid metadata", func(properties *armcompute.VirtualMachineImageProperties, lookupErr error, reason string) {
+			marketplaceImagesAPI.GetFunc = func(_ context.Context, _, _, _, sku, _ string, _ *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+				if sku == "amd64" {
+					return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{
+						Properties: &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypesX64), HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypesV2)},
+					}}, nil
+				}
+				return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{Properties: properties}}, lookupErr
+			}
+			images, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).To(MatchError(ContainSubstring(reason)))
+			Expect(images).To(BeEmpty())
+		},
+			Entry("API failure after partial success", nil, fmt.Errorf("Azure unavailable"), "Azure unavailable"),
+			Entry("missing properties", nil, nil, "no architecture metadata"),
+			Entry("missing architecture", &armcompute.VirtualMachineImageProperties{}, nil, "no architecture metadata"),
+			Entry("unsupported architecture", &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypes("unknown"))}, nil, "unsupported architecture"),
+			Entry("duplicate architecture", &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypesX64), HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypesV2)}, nil, "multiple marketplace images"),
+			Entry("missing generation after partial success", &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypesArm64)}, nil, "no Hyper-V generation metadata"),
+			Entry("empty generation", &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypesArm64), HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypes(""))}, nil, "unsupported Hyper-V generation"),
+			Entry("unknown generation", &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypesArm64), HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypes("unknown"))}, nil, "unsupported Hyper-V generation"),
+		)
+		It("rejects malformed URNs", func() {
+			nodeClass.Spec.MarketplaceImages = []string{"publisher:offer:sku"}
+			images, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).To(HaveOccurred())
+			Expect(images).To(BeEmpty())
+		})
+		It("rejects latest before looking up image metadata", func() {
+			nodeClass.Spec.MarketplaceImages = []string{"publisher:offer:sku:latest"}
+			lookupCalls := 0
+			marketplaceImagesAPI.GetFunc = func(context.Context, string, string, string, string, string, *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+				lookupCalls++
+				return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{
+					Properties: &armcompute.VirtualMachineImageProperties{Architecture: lo.ToPtr(armcompute.ArchitectureTypesX64), HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypesV2)},
+				}}, nil
+			}
+			images, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).To(MatchError(ContainSubstring("explicit version")))
+			Expect(images).To(BeEmpty())
+			Expect(lookupCalls).To(BeZero())
+		})
+		It("reuses successful metadata across node classes for five minutes without changing image order", func() {
+			lookupCalls := map[string]int{}
+			marketplaceImagesAPI.GetFunc = func(_ context.Context, _, _, _, sku, _ string, _ *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+				lookupCalls[sku]++
+				arch := armcompute.ArchitectureTypesX64
+				if sku == "arm64" {
+					arch = armcompute.ArchitectureTypesArm64
+				}
+				return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{Properties: &armcompute.VirtualMachineImageProperties{
+					Architecture: &arch, HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypesV2),
+				}}}, nil
+			}
+			imagesCache := cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval)
+			provider := imagefamily.NewProvider(nil, marketplaceImagesAPI, fake.Region, customerSubscription, nil, imagesCache)
+			images, err := provider.List(ctx, nodeClass)
+			Expect(err).NotTo(HaveOccurred())
+			other := nodeClass.DeepCopy()
+			other.Spec.MarketplaceImages = []string{nodeClass.Spec.MarketplaceImages[1], nodeClass.Spec.MarketplaceImages[0]}
+			reversed, err := provider.List(ctx, other)
+			Expect(err).NotTo(HaveOccurred())
+			Expect([]string{reversed[0].ID, reversed[1].ID}).To(Equal([]string{images[1].ID, images[0].ID}))
+			Expect(lookupCalls).To(Equal(map[string]int{"amd64": 1, "arm64": 1}))
+			_, expires, found := imagesCache.GetWithExpiration("marketplace:" + fake.Region + ":" + images[0].ID)
+			Expect(found).To(BeTrue())
+			Expect(time.Until(expires)).To(BeNumerically(">", 4*time.Minute))
+			Expect(time.Until(expires)).To(BeNumerically("<=", 5*time.Minute))
+			imagesCache.Flush() // Simulate expiry without waiting for the real TTL.
+			_, err = provider.List(ctx, other)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(lookupCalls).To(Equal(map[string]int{"amd64": 2, "arm64": 2}))
+		})
+		It("retries failed lookups without publishing a partial image list", func() {
+			lookupCalls := map[string]int{}
+			marketplaceImagesAPI.GetFunc = func(_ context.Context, _, _, _, sku, _ string, _ *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+				lookupCalls[sku]++
+				if sku == "arm64" && lookupCalls[sku] == 1 {
+					return armcompute.VirtualMachineImagesClientGetResponse{}, fmt.Errorf("temporarily inaccessible")
+				}
+				arch := armcompute.ArchitectureTypesX64
+				if sku == "arm64" {
+					arch = armcompute.ArchitectureTypesArm64
+				}
+				return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{Properties: &armcompute.VirtualMachineImageProperties{
+					Architecture: &arch, HyperVGeneration: lo.ToPtr(armcompute.HyperVGenerationTypesV2),
+				}}}, nil
+			}
+			images, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).To(MatchError(ContainSubstring("temporarily inaccessible")))
+			Expect(images).To(BeEmpty())
+			images, err = nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(images).To(HaveLen(2))
+			Expect(lookupCalls).To(Equal(map[string]int{"amd64": 1, "arm64": 2}))
+		})
 	})
 
 	Context("List CIG Images", func() {
