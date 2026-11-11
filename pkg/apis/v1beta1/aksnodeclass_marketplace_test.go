@@ -23,102 +23,61 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestHasMarketplaceImage(t *testing.T) {
-	cases := []struct {
-		name     string
-		image    *v1beta1.MarketplaceImage
-		expected bool
+func TestHasMarketplaceImages(t *testing.T) {
+	cases := map[string]struct {
+		images []string
+		want   bool
 	}{
-		{
-			name:     "nil marketplace image",
-			image:    nil,
-			expected: false,
-		},
-		{
-			name: "complete marketplace image",
-			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-				Version:   "9.8.20260428",
-			},
-			expected: true,
-		},
-		{
-			name: "missing version",
-			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-			},
-			expected: false,
-		},
-		{
-			name: "empty publisher",
-			image: &v1beta1.MarketplaceImage{
-				Publisher: "",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-				Version:   "9.8.20260428",
-			},
-			expected: false,
-		},
+		"omitted": {},
+		"empty":   {images: []string{}},
+		"one":     {images: []string{"publisher:offer:sku:1.0.0"}, want: true},
+		"multiple": {images: []string{
+			"publisher:offer:amd64:1.0.0", "publisher:offer:arm64:1.0.0",
+		}, want: true},
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
-			nodeClass := &v1beta1.AKSNodeClass{
-				Spec: v1beta1.AKSNodeClassSpec{
-					MarketplaceImage: tc.image,
-				},
-			}
-			g.Expect(nodeClass.HasMarketplaceImage()).To(Equal(tc.expected))
+			nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{MarketplaceImages: tc.images}}
+			g.Expect(nodeClass.HasMarketplaceImages()).To(Equal(tc.want))
 		})
 	}
 }
 
-func TestMarketplaceImageURN(t *testing.T) {
-	cases := []struct {
-		name     string
-		image    *v1beta1.MarketplaceImage
-		expected string
+func TestParseMarketplaceImageURN(t *testing.T) {
+	cases := map[string]struct {
+		urn  string
+		want *v1beta1.MarketplaceImage
 	}{
-		{
-			name:     "nil marketplace image",
-			image:    nil,
-			expected: "",
-		},
-		{
-			name: "complete marketplace image",
-			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-				Version:   "9.8.20260428",
-			},
-			expected: "azureopenshift:aro4:aro_422-v2:9.8.20260428",
-		},
-		{
-			name: "incomplete marketplace image",
-			image: &v1beta1.MarketplaceImage{
-				Publisher: "azureopenshift",
-				Offer:     "aro4",
-				SKU:       "aro_422-v2",
-			},
-			expected: "",
-		},
+		"explicit version": {urn: "publisher:offer:sku:1.0.0", want: &v1beta1.MarketplaceImage{
+			Publisher: "publisher", Offer: "offer", SKU: "sku", Version: "1.0.0",
+		}},
+		"nonnumeric version": {urn: "publisher:offer:sku:some-version", want: &v1beta1.MarketplaceImage{
+			Publisher: "publisher", Offer: "offer", SKU: "sku", Version: "some-version",
+		}},
+		"latest":            {urn: "publisher:offer:sku:latest"},
+		"newline":           {urn: "publisher:offer:sku:1.0.0\n"},
+		"space":             {urn: "pub lisher:offer:sku:1.0.0"},
+		"tab":               {urn: "publisher:of\tfer:sku:1.0.0"},
+		"empty":             {},
+		"missing component": {urn: "publisher:offer:sku"},
+		"extra component":   {urn: "publisher:offer:sku:version:extra"},
+		"empty publisher":   {urn: ":offer:sku:version"},
+		"empty offer":       {urn: "publisher::sku:version"},
+		"empty sku":         {urn: "publisher:offer::version"},
+		"empty version":     {urn: "publisher:offer:sku:"},
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
-			nodeClass := &v1beta1.AKSNodeClass{
-				Spec: v1beta1.AKSNodeClassSpec{
-					MarketplaceImage: tc.image,
-				},
+			image, err := v1beta1.ParseMarketplaceImageURN(tc.urn)
+			if tc.want == nil {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(image).To(BeNil())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(image).To(Equal(tc.want))
 			}
-			g.Expect(nodeClass.MarketplaceImageURN()).To(Equal(tc.expected))
 		})
 	}
 }

@@ -138,18 +138,26 @@ func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta
 }
 
 func validateOpenShiftNodeClass(nodeClass *v1beta1.AKSNodeClass) error {
-	if !nodeClass.HasMarketplaceImage() {
-		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("marketplaceImage is required in OpenShift mode"))
+	if !nodeClass.HasMarketplaceImages() {
+		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("marketplaceImages is required in OpenShift mode"))
 	}
 	if nodeClass.Spec.UserData == nil || *nodeClass.Spec.UserData == "" {
 		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("userData is required in OpenShift mode"))
 	}
 	for _, conditionType := range []string{
 		v1beta1.ConditionTypeSubnetsReady,
+		v1beta1.ConditionTypeImagesReady,
 	} {
 		if err := validateNodeClassCondition(nodeClass, conditionType); err != nil {
 			return err
 		}
+	}
+	// Validate that at least one ready, current-generation image can serve a supported architecture.
+	if _, err := imagefamily.ResolveMarketplaceImageFromNodeClass(nodeClass, &cloudprovider.InstanceType{
+		Name:         "supported architectures",
+		Requirements: scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, karpv1.ArchitectureAmd64, karpv1.ArchitectureArm64)),
+	}); err != nil {
+		return cloudprovider.NewNodeClassNotReadyError(err)
 	}
 	return nil
 }
@@ -495,6 +503,15 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	if err != nil {
 		return nil, err
 	}
+	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
+		if err := validateOpenShiftNodeClass(nodeClass); err != nil {
+			return nil, err
+		}
+		instanceTypes = lo.Filter(instanceTypes, func(instanceType *cloudprovider.InstanceType, _ int) bool {
+			_, err := imagefamily.ResolveMarketplaceImageFromNodeClass(nodeClass, instanceType)
+			return err == nil
+		})
+	}
 	return instanceTypes, nil
 }
 
@@ -628,6 +645,11 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
 
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	return lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+		if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
+			if _, err := imagefamily.ResolveMarketplaceImageFromNodeClass(nodeClass, i); err != nil {
+				return false
+			}
+		}
 		return reqs.Compatible(i.Requirements, v1beta1.AllowUndefinedWellKnownAndRestrictedLabels) == nil &&
 			len(i.Offerings.Compatible(reqs).Available()) > 0 &&
 			resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
@@ -646,7 +668,12 @@ func (c *CloudProvider) resolveInstanceTypeFromVMInstance(ctx context.Context, v
 		// If we can't resolve the provisioner, we fallback to not getting instance type info
 		return nil, client.IgnoreNotFound(fmt.Errorf("resolving node pool, %w", err))
 	}
-	instanceTypes, err := c.GetInstanceTypes(ctx, nodePool)
+	// Existing VMs still need catalog metadata even if their images are no longer selected.
+	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
+	if err != nil {
+		return nil, client.IgnoreNotFound(fmt.Errorf("resolving node template, %w", err))
+	}
+	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		// If we can't resolve the nodepool, we fallback to not getting instance type info
 		return nil, client.IgnoreNotFound(fmt.Errorf("resolving node template, %w", err))

@@ -17,6 +17,7 @@ limitations under the License.
 package status_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -182,28 +183,90 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 			nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
 		})
 
-		Context("Marketplace image", func() {
+		Context("MarketplaceImages", func() {
 			var imageReconciler *status.NodeImageReconciler
 
 			BeforeEach(func() {
 				imageReconciler = status.NewNodeImageReconciler(azureEnv.ImageProvider, env.KubernetesInterface)
+				nodeClass.Spec.MarketplaceImages = []string{"publisher:offer:amd64:1.0.0", "publisher:offer:arm64:1.0.0"}
+				nodeClass.Status.KubernetesVersion = nil
+				nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeKubernetesVersionReady, "NotAKS", "not AKS")
+				azureEnv.VirtualMachineImagesAPI.GetFunc = func(_ context.Context, _, _, _, sku, _ string, _ *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+					arch := armcompute.ArchitectureTypesX64
+					generation := armcompute.HyperVGenerationTypesV1
+					if sku == "arm64" {
+						arch = armcompute.ArchitectureTypesArm64
+						generation = armcompute.HyperVGenerationTypesV2
+					}
+					return armcompute.VirtualMachineImagesClientGetResponse{VirtualMachineImage: armcompute.VirtualMachineImage{Properties: &armcompute.VirtualMachineImageProperties{Architecture: &arch, HyperVGeneration: &generation}}}, nil
+				}
 			})
 
-			It("should set status from spec and skip gallery resolution", func() {
-				nodeClass.Spec.MarketplaceImage = &v1beta1.MarketplaceImage{
-					Publisher: "azureopenshift",
-					Offer:     "aro4",
-					SKU:       "aro_422-v2",
-					Version:   "9.8.20260428",
-				}
-
+			It("publishes resolved architectures and generations without AKS version readiness", func() {
 				result, err := imageReconciler.Reconcile(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
-				Expect(nodeClass.Status.Images).To(HaveLen(1))
-				Expect(nodeClass.Status.Images[0].ID).To(Equal("azureopenshift:aro4:aro_422-v2:9.8.20260428"))
-				Expect(nodeClass.Status.Images[0].Requirements).To(BeEmpty())
+				Expect(nodeClass.Status.Images).To(Equal([]v1beta1.NodeImage{
+					{ID: "publisher:offer:amd64:1.0.0", Requirements: []corev1.NodeSelectorRequirement{
+						{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}},
+						{Key: v1beta1.LabelSKUHyperVGeneration, Operator: corev1.NodeSelectorOpIn, Values: []string{"1"}},
+					}},
+					{ID: "publisher:offer:arm64:1.0.0", Requirements: []corev1.NodeSelectorRequirement{
+						{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"arm64"}},
+						{Key: v1beta1.LabelSKUHyperVGeneration, Operator: corev1.NodeSelectorOpIn, Values: []string{"2"}},
+					}},
+				}))
 				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+			})
+			DescribeTable("clears successful status on partial failure and recovers", func(missingGeneration bool) {
+				success := azureEnv.VirtualMachineImagesAPI.GetFunc
+				_, err := imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).NotTo(HaveOccurred())
+				resolvedImages := nodeClass.Status.Images
+				azureEnv.VirtualMachineImagesAPI.GetFunc = func(ctx context.Context, location, publisher, offer, sku, version string, opts *armcompute.VirtualMachineImagesClientGetOptions) (armcompute.VirtualMachineImagesClientGetResponse, error) {
+					if sku == "arm64" {
+						if missingGeneration {
+							response, err := success(ctx, location, publisher, offer, sku, version, opts)
+							response.Properties.HyperVGeneration = nil
+							return response, err
+						}
+						return armcompute.VirtualMachineImagesClientGetResponse{}, fmt.Errorf("image inaccessible")
+					}
+					return success(ctx, location, publisher, offer, sku, version, opts)
+				}
+				_, err = imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).To(HaveOccurred())
+				if missingGeneration {
+					Expect(err.Error()).To(ContainSubstring("no Hyper-V generation metadata"))
+				}
+				Expect(nodeClass.Status.Images).To(BeEmpty())
+				Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).IsFalse()).To(BeTrue())
+				_, err = nodeClass.GetImages()
+				Expect(err).To(HaveOccurred())
+				azureEnv.VirtualMachineImagesAPI.GetFunc = success
+				_, err = imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(nodeClass.Status.Images).To(Equal(resolvedImages))
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+			},
+				Entry("lookup failure", false),
+				Entry("missing Hyper-V generation", true),
+			)
+			It("refreshes current-generation status outside maintenance windows without processing URNs as gallery IDs", func() {
+				GinkgoT().Setenv("SYSTEM_NAMESPACE", "kube-system")
+				ExpectApplied(ctx, env.Client, getClosedMWConfigMap())
+				imageReconciler = status.NewNodeImageReconciler(azureEnv.ImageProvider, env.KubernetesInterface)
+				_, err := imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).NotTo(HaveOccurred())
+				nodeClass.Generation++
+				nodeClass.Spec.MarketplaceImages[0] = "publisher:offer:amd64:2.0.0"
+				_, err = nodeClass.GetImages()
+				Expect(err).To(HaveOccurred())
+				_, err = imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).NotTo(HaveOccurred())
+				images, err := nodeClass.GetImages()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(images[0].ID).To(Equal("publisher:offer:amd64:2.0.0"))
 			})
 		})
 

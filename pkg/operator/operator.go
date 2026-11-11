@@ -185,6 +185,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	)
 	imageProvider := imagefamily.NewProvider(
 		azClient.ImageVersionsClient,
+		azClient.VirtualMachineImagesClient,
 		azConfig.Location,
 		azConfig.SubscriptionID,
 		azClient.NodeImageVersionsClient,

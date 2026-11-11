@@ -118,7 +118,7 @@ func (p *Provider) GetTemplate(
 	additionalLabels map[string]string,
 ) (*Template, error) {
 	if p.provisionMode == consts.ProvisionModeOpenShift {
-		launchTemplate, err := p.getOpenShiftTemplate(ctx, nodeClass)
+		launchTemplate, err := p.getOpenShiftTemplate(ctx, nodeClass, instanceType)
 		if err != nil {
 			return nil, err
 		}
@@ -223,18 +223,21 @@ func getAgentbakerNetworkPlugin(ctx context.Context) string {
 }
 
 // getOpenShiftTemplate creates a simplified template for OpenShift mode.
-// It uses marketplaceImage and userData directly from the nodeClass, bypassing AKS-specific bootstrap.
-//
-//nolint:unparam
-func (p *Provider) getOpenShiftTemplate(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (*Template, error) {
+// It selects a resolved status image and uses raw userData, bypassing AKS-specific bootstrap.
+func (p *Provider) getOpenShiftTemplate(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, instanceType *cloudprovider.InstanceType) (*Template, error) {
+	urn, err := imagefamily.ResolveMarketplaceImageFromNodeClass(nodeClass, instanceType)
+	if err != nil {
+		return nil, err
+	}
+	image, err := v1beta1.ParseMarketplaceImageURN(urn)
+	if err != nil {
+		return nil, err
+	}
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
 
 	template := &Template{
-		SubnetID: subnetID,
-	}
-
-	if nodeClass.HasMarketplaceImage() {
-		template.MarketplaceImage = nodeClass.Spec.MarketplaceImage.DeepCopy()
+		SubnetID:         subnetID,
+		MarketplaceImage: image,
 	}
 
 	if nodeClass.Spec.UserData != nil && *nodeClass.Spec.UserData != "" {

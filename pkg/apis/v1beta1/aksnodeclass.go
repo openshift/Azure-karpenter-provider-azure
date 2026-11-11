@@ -18,6 +18,8 @@ package v1beta1
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
@@ -77,10 +79,15 @@ type AKSNodeClassSpec struct {
 	// ImageID is the ID of the image that instances use.
 	// Not exposed in the API yet
 	ImageID *string `json:"-"`
-	// marketplaceImage selects an Azure Marketplace platform image by publisher/offer/sku/version.
-	// For OpenShift mode, use this for ARO RHCOS images (e.g. azureopenshift/aro4/aro_422-v2/...).
+	// marketplaceImages selects Azure Marketplace platform images by Publisher:Offer:Sku:Version URN.
+	// Each image must resolve to a distinct architecture.
+	// The version must be explicit; latest is not supported.
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Pattern=`^[^:\s]+:[^:\s]+:[^:\s]+:[^:\s]+$`
+	// +kubebuilder:validation:XValidation:message="marketplaceImages must specify an explicit version; latest is not supported",rule="self.all(image, !image.endsWith(':latest'))"
 	// +optional
-	MarketplaceImage *MarketplaceImage `json:"marketplaceImage,omitempty"`
+	MarketplaceImages []string `json:"marketplaceImages,omitempty"`
 	// imageFamily is the image family that instances use.
 	// +default="Ubuntu"
 	// +kubebuilder:validation:Enum:={Ubuntu,Ubuntu2204,Ubuntu2404,AzureLinux}
@@ -747,25 +754,23 @@ func (in *AKSNodeClass) GetEncryptionAtHost() bool {
 	return false
 }
 
-// HasMarketplaceImage returns true when a complete marketplace image tuple is configured.
-func (in *AKSNodeClass) HasMarketplaceImage() bool {
-	if in.Spec.MarketplaceImage == nil {
-		return false
-	}
-	m := in.Spec.MarketplaceImage
-	return m.Publisher != "" &&
-		m.Offer != "" &&
-		m.SKU != "" &&
-		m.Version != ""
+// HasMarketplaceImages returns true when marketplace image URNs are configured.
+func (in *AKSNodeClass) HasMarketplaceImages() bool {
+	return len(in.Spec.MarketplaceImages) > 0
 }
 
-// MarketplaceImageURN returns the standard Publisher:Offer:Sku:Version representation.
-func (in *AKSNodeClass) MarketplaceImageURN() string {
-	if !in.HasMarketplaceImage() {
-		return ""
+var marketplaceImageURNPattern = regexp.MustCompile(`^[^:\s]+:[^:\s]+:[^:\s]+:[^:\s]+$`)
+
+// ParseMarketplaceImageURN parses a Publisher:Offer:Sku:Version marketplace URN with an explicit version and no whitespace.
+func ParseMarketplaceImageURN(urn string) (*MarketplaceImage, error) {
+	if !marketplaceImageURNPattern.MatchString(urn) {
+		return nil, fmt.Errorf("invalid marketplace image URN %q: expected four nonempty Publisher:Offer:Sku:Version components without whitespace", urn)
 	}
-	m := in.Spec.MarketplaceImage
-	return fmt.Sprintf("%s:%s:%s:%s", m.Publisher, m.Offer, m.SKU, m.Version)
+	parts := strings.Split(urn, ":")
+	if parts[3] == "latest" {
+		return nil, fmt.Errorf("invalid marketplace image URN %q: an explicit version is required; latest is not supported", urn)
+	}
+	return &MarketplaceImage{Publisher: parts[0], Offer: parts[1], SKU: parts[2], Version: parts[3]}, nil
 }
 
 // IsArtifactStreamingEnabled returns whether artifact streaming should be enabled for this node class.

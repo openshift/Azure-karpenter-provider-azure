@@ -19,6 +19,7 @@ package v1beta1_test
 import (
 	"strings"
 
+	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Pallinder/go-randomdata"
 	. "github.com/onsi/ginkgo/v2"
@@ -1456,37 +1457,56 @@ var _ = Describe("CEL/Validation", func() {
 		})
 	})
 
-	Context("MarketplaceImage", func() {
-		It("should accept a complete marketplace image", func() {
-			nodeClass := &v1beta1.AKSNodeClass{
-				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
-				Spec: v1beta1.AKSNodeClassSpec{
-					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "azureopenshift",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
-					},
-				},
+	Context("MarketplaceImages", func() {
+		DescribeTable("validates marketplace URNs", func(images []interface{}, valid bool) {
+			spec := map[string]interface{}{}
+			if images != nil {
+				spec["marketplaceImages"] = images
 			}
-			Expect(env.Client.Create(ctx, nodeClass)).To(Succeed())
-		})
-
-		It("should reject marketplace image with an empty publisher", func() {
-			nodeClass := &v1beta1.AKSNodeClass{
-				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
-				Spec: v1beta1.AKSNodeClassSpec{
-					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
-					},
-				},
-			}
+			nodeClass := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "karpenter.azure.com/v1beta1",
+				"kind":       "AKSNodeClass",
+				"metadata":   map[string]interface{}{"name": strings.ToLower(randomdata.SillyName())},
+				"spec":       spec,
+			}}
 			err := env.Client.Create(ctx, nodeClass)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("spec.marketplaceImage.publisher: Required value"))
+			if valid {
+				Expect(err).NotTo(HaveOccurred())
+			} else {
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("spec.marketplaceImages"))
+			}
+		},
+			Entry("omitted for AKS", nil, true),
+			Entry("two images with explicit versions", []interface{}{"publisher:offer:amd64:1.0.0", "publisher:offer:arm64:1.0.0"}, true),
+			Entry("nonnumeric version", []interface{}{"publisher:offer:sku:some-version"}, true),
+			Entry("latest", []interface{}{"publisher:offer:sku:latest"}, false),
+			Entry("two images including latest", []interface{}{"publisher:offer:amd64:1.0.0", "publisher:offer:arm64:latest"}, false),
+			Entry("newline", []interface{}{"publisher:offer:sku:1.0.0\n"}, false),
+			Entry("space", []interface{}{"pub lisher:offer:sku:1.0.0"}, false),
+			Entry("tab", []interface{}{"publisher:of\tfer:sku:1.0.0"}, false),
+			Entry("explicit empty list", []interface{}{}, false),
+			Entry("missing component", []interface{}{"publisher:offer:sku"}, false),
+			Entry("extra component", []interface{}{"publisher:offer:sku:version:extra"}, false),
+			Entry("empty publisher", []interface{}{":offer:sku:version"}, false),
+			Entry("empty offer", []interface{}{"publisher::sku:version"}, false),
+			Entry("empty SKU", []interface{}{"publisher:offer::version"}, false),
+			Entry("empty version", []interface{}{"publisher:offer:sku:"}, false),
+		)
+		It("no longer defines the singular field in the schema", func() {
+			for _, crd := range apis.CRDs {
+				if crd.Name != "aksnodeclasses.karpenter.azure.com" {
+					continue
+				}
+				for _, version := range crd.Spec.Versions {
+					if version.Name != "v1beta1" {
+						continue
+					}
+					properties := version.Schema.OpenAPIV3Schema.Properties["spec"].Properties
+					Expect(properties).NotTo(HaveKey("marketplaceImage"))
+					Expect(properties).To(HaveKey("marketplaceImages"))
+				}
+			}
 		})
 	})
 
