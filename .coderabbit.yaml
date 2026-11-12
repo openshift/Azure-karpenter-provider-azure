@@ -1,0 +1,32 @@
+inheritance: true
+language: en-US
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  high_level_summary_in_walkthrough: true
+  review_status: true
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  poem: false
+  suggested_labels: false
+  changed_files_summary: true
+  auto_review:
+    enabled: true
+    drafts: true
+  path_filters:
+    - "!vendor/**"
+  tools:
+    golangci-lint:
+      enabled: true
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - AGENTS.md
+      - .claude/agents/*.md
+      - .cursor/rules/*.mdc
+  learnings:
+    scope: local

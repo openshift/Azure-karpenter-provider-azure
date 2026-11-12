@@ -5,6 +5,8 @@ LDFLAGS ?= -ldflags=-X=sigs.k8s.io/karpenter/pkg/operator.Version=$(shell git de
 
 GOFLAGS ?= $(LDFLAGS)
 
+BUILD_DEST ?= bin/azure-karpenter-provider
+
 # # CR for local builds of Karpenter
 KARPENTER_NAMESPACE ?= kube-system
 
@@ -27,6 +29,9 @@ LABEL_FILTER ?=
 
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+build: ## Build the controller binary
+	go build -o $(BUILD_DEST) $(GOFLAGS) ./cmd/controller
 
 presubmit: verify test ## Run all steps in the developer loop
 
@@ -163,7 +168,7 @@ tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
 download: ## Recursively "go mod download" on all directories where go.mod exists
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
 
-.PHONY: help presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download
+.PHONY: help build presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download
 
 define newline
 
