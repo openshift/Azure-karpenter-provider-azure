@@ -62,6 +62,8 @@ require (
 	sigs.k8s.io/karpenter v1.15.1
 )
 
+replace sigs.k8s.io/karpenter => github.com/openshift/kubernetes-sigs-karpenter v0.0.0-20261110172752-280f26969b1f
+
 require (
 	cel.dev/expr v0.25.2 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.13.0 // indirect

@@ -1,0 +1,256 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package metrics
+
+import (
+	"context"
+
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/injection"
+)
+
+const (
+	metricLabelMethod   = "method"
+	metricLabelProvider = "provider"
+	metricLabelError    = "error"
+	// MetricLabelErrorDefaultVal is the `error` value for any error outside the
+	// well-known categories.
+	MetricLabelErrorDefaultVal = "unknown"
+)
+
+// Well-known `error` dimension values. These are metric-only values, so they are
+// first-class opmetrics.Value vars: the value string and its documentation live in
+// one place and callers refer to it by .Name.
+var (
+	NodeClaimNotFoundError = opmetrics.Value{
+		Name: "NodeClaimNotFoundError",
+		Help: "The NodeClaim's backing instance was not found.",
+	}
+	NodeClassNotReadyError = opmetrics.Value{
+		Name: "NodeClassNotReadyError",
+		Help: "The referenced NodeClass is not yet ready.",
+	}
+	InsufficientCapacityError = opmetrics.Value{
+		Name: "InsufficientCapacityError",
+		Help: "The cloud provider had insufficient capacity to fulfill the request.",
+	}
+	// UnknownError is the value emitted for any error outside the well-known
+	// categories above (GetErrorTypeLabelValue's default).
+	UnknownError = opmetrics.Value{
+		Name: MetricLabelErrorDefaultVal,
+		Help: "An error that does not match a well-known CloudProvider error category.",
+	}
+)
+
+// Package-local metric dimensions for the CloudProvider metrics. The controller
+// dimension reuses the shared metrics.Controller description.
+var (
+	Method = opmetrics.Label{
+		Name: metricLabelMethod,
+		Help: "The CloudProvider interface method that was called, e.g. `Create`, `Delete`, `Get`, `List`, `GetInstanceTypes`, `IsDrifted`.",
+	}
+	Provider = opmetrics.Label{
+		Name: metricLabelProvider,
+		Help: "The name of the cloud provider implementation.",
+	}
+	Error = opmetrics.Label{
+		Name:   metricLabelError,
+		Help:   "The category of error returned by the CloudProvider call.",
+		Values: []opmetrics.Value{NodeClaimNotFoundError, NodeClassNotReadyError, InsufficientCapacityError, UnknownError},
+	}
+)
+
+// decorator implements CloudProvider
+var _ cloudprovider.CloudProvider = (*decorator)(nil)
+
+var MethodDuration = opmetrics.NewPrometheusHistogram(
+	crmetrics.Registry,
+	prometheus.HistogramOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: "cloudprovider",
+		Name:      "duration_seconds",
+		Help:      "Duration of cloud provider method calls. Labeled by the controller, method name and provider.",
+	},
+	[]opmetrics.Label{
+		metrics.Controller,
+		Method,
+		Provider,
+	},
+	opmetrics.Beta,
+)
+
+var (
+	ErrorsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: "cloudprovider",
+			Name:      "errors_total",
+			Help:      "Total number of errors returned from CloudProvider calls.",
+		},
+		[]opmetrics.Label{
+			metrics.Controller,
+			Method,
+			Provider,
+			Error,
+			metrics.NodePool,
+		},
+		opmetrics.Beta,
+	)
+)
+
+type decorator struct {
+	cloudprovider.CloudProvider
+}
+
+// Decorate returns a new `CloudProvider` instance that will delegate all method
+// calls to the argument, `cloudProvider`, and publish aggregated latency metrics. The
+// value used for the metric label, "controller", is taken from the `Context` object
+// passed to the methods of `CloudProvider`.
+//
+// Do not decorate a `CloudProvider` multiple times or published metrics will contain
+// duplicated method call counts and latencies.
+func Decorate(cloudProvider cloudprovider.CloudProvider) cloudprovider.CloudProvider {
+	return &decorator{cloudProvider}
+}
+
+func (d *decorator) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1.NodeClaim, error) {
+	method := "Create"
+	nodePoolName := nodePoolNameForNodeClaim(nodeClaim)
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	nodeClaim, err := d.CloudProvider.Create(ctx, nodeClaim)
+	if err != nil {
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, nodePoolName, err))
+	}
+	return nodeClaim, err
+}
+
+func (d *decorator) Delete(ctx context.Context, nodeClaim *v1.NodeClaim) error {
+	method := "Delete"
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	err := d.CloudProvider.Delete(ctx, nodeClaim)
+	if err != nil {
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, nodePoolNameForNodeClaim(nodeClaim), err))
+	}
+	return err
+}
+
+func (d *decorator) Reboot(ctx context.Context, nodeClaim *v1.NodeClaim, operationID string) error {
+	method := "Reboot"
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	err := d.CloudProvider.Reboot(ctx, nodeClaim, operationID)
+	if err != nil {
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, nodePoolNameForNodeClaim(nodeClaim), err))
+	}
+	return err
+}
+
+func (d *decorator) Get(ctx context.Context, id string) (*v1.NodeClaim, error) {
+	method := "Get"
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	nodeClaim, err := d.CloudProvider.Get(ctx, id)
+	if err != nil {
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, nodePoolNameForNodeClaim(nodeClaim), err))
+	}
+	return nodeClaim, err
+}
+
+func (d *decorator) List(ctx context.Context) ([]*v1.NodeClaim, error) {
+	method := "List"
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	nodeClaims, err := d.CloudProvider.List(ctx)
+	if err != nil {
+		// List can cover multiple NodePools, so there is no single NodePool to label.
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, "", err))
+	}
+	return nodeClaims, err
+}
+
+func (d *decorator) GetInstanceTypes(ctx context.Context, nodePool *v1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	method := "GetInstanceTypes"
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	instanceType, err := d.CloudProvider.GetInstanceTypes(ctx, nodePool)
+	if err != nil {
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, nodePoolNameForNodePool(nodePool), err))
+	}
+	return instanceType, err
+}
+
+func (d *decorator) IsDrifted(ctx context.Context, nodeClaim *v1.NodeClaim) (cloudprovider.DriftReason, error) {
+	method := "IsDrifted"
+	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()
+	isDrifted, err := d.CloudProvider.IsDrifted(ctx, nodeClaim)
+	if err != nil {
+		ErrorsTotal.Inc(getLabelsMapForError(ctx, d, method, nodePoolNameForNodeClaim(nodeClaim), err))
+	}
+	return isDrifted, err
+}
+
+// getLabelsMapForDuration is a convenience func that constructs a map[string]string
+// for a prometheus Label map used to compose a duration metric spec
+func getLabelsMapForDuration(ctx context.Context, d *decorator, method string) map[string]string {
+	return map[string]string{
+		metrics.ControllerLabel: injection.GetControllerName(ctx),
+		metricLabelMethod:       method,
+		metricLabelProvider:     d.Name(),
+	}
+}
+
+// getLabelsMapForError builds labels for CloudProvider error metrics.
+func getLabelsMapForError(ctx context.Context, d *decorator, method, nodePoolName string, err error) map[string]string {
+	return map[string]string{
+		metrics.ControllerLabel: injection.GetControllerName(ctx),
+		metricLabelMethod:       method,
+		metricLabelProvider:     d.Name(),
+		metricLabelError:        GetErrorTypeLabelValue(err),
+		metrics.NodePoolLabel:   nodePoolName,
+	}
+}
+
+func nodePoolNameForNodeClaim(nodeClaim *v1.NodeClaim) string {
+	if nodeClaim == nil {
+		return ""
+	}
+	return nodeClaim.Labels[v1.NodePoolLabelKey]
+}
+
+func nodePoolNameForNodePool(nodePool *v1.NodePool) string {
+	if nodePool == nil {
+		return ""
+	}
+	return nodePool.Name
+}
+
+// GetErrorTypeLabelValue returns the label for a known CloudProvider error.
+func GetErrorTypeLabelValue(err error) string {
+	switch {
+	case cloudprovider.IsInsufficientCapacityError(err):
+		return InsufficientCapacityError.Name
+	case cloudprovider.IsNodeClaimNotFoundError(err):
+		return NodeClaimNotFoundError.Name
+	case cloudprovider.IsNodeClassNotReadyError(err):
+		return NodeClassNotReadyError.Name
+	default:
+		return MetricLabelErrorDefaultVal
+	}
+}

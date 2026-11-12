@@ -4,9 +4,12 @@ coverage.html
 *.test
 *.cpuprofile
 *.heapprofile
-go.work
-go.work.sum
 *.out
+
+# Third-party modules may contain their own workspace files. Keep the
+# repository-root go.work available while ignoring vendored workspaces.
+vendor/**/go.work
+vendor/**/go.work.sum
 
 # Environment
 .idea

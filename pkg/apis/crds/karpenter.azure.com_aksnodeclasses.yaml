@@ -2458,6 +2458,13 @@ spec:
                   rule: self.all(k, !k.contains('\\'))
                 - message: tags values must be less than 256 characters
                   rule: self.all(k, size(self[k]) <= 256)
+              userData:
+                description: |-
+                  userData is the raw bootstrap payload (e.g. Ignition config for OpenShift) passed as CustomData to the VM.
+                  The provider base64-encodes this internally — provide raw text, not pre-encoded.
+                  When specified in OpenShift mode, this bypasses the default AKS bootstrap script generation.
+                maxLength: 65536
+                type: string
               versions:
                 description: |-
                   versions controls the Kubernetes and node image versions for the NodeClass.
@@ -2483,13 +2490,6 @@ spec:
                 - message: kubernetesVersion must be set when nodeImageVersion is
                     set
                   rule: '!has(self.nodeImageVersion) || has(self.kubernetesVersion)'
-              userData:
-                description: |-
-                  userData is the raw bootstrap payload (e.g. Ignition config for OpenShift) passed as CustomData to the VM.
-                  The provider base64-encodes this internally — provide raw text, not pre-encoded.
-                  When specified in OpenShift mode, this bypasses the default AKS bootstrap script generation.
-                maxLength: 65536
-                type: string
               vnetSubnetID:
                 description: |-
                   vnetSubnetID is the subnet used by nics provisioned with this nodeclass.

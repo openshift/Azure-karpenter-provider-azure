@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -exuo pipefail
 
-K8S_VERSION="${K8S_VERSION:=1.32.x}"
+K8S_VERSION="${K8S_VERSION:=1.37.x}"
 export GOFLAGS=""
 
 TOOL_DEST="$(go env GOPATH)/bin"

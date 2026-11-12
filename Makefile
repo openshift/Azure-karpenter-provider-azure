@@ -174,11 +174,20 @@ openshift-toolchain:
 openshift-verify: ## Verify code. Includes dependencies, linting, formatting, etc
 	go generate ./...
 	hack/boilerplate.sh
-	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
+	# Copy pinned core CRDs and make the local copies writable
+	cp -f $(addprefix vendor/sigs.k8s.io/karpenter/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
+	chmod u+w $(addprefix pkg/apis/crds/,$(KARPENTER_CORE_CRDS))
+	# Apply provider-specific CRD changes before packaging them
+	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
+	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
+	# Package the adjusted CRDs, then validate CapacityBuffer chart delivery
+	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
+	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
+	GOFLAGS=-mod=mod hack/validation/capacitybuffer.sh
+	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
 	@git diff --quiet ||\
 		{ echo "New file modification detected in the Git working tree. Please check in before commit."; git --no-pager diff --name-only | uniq | awk '{print "  - " $$0}'; \
@@ -190,11 +199,16 @@ openshift-verify: ## Verify code. Includes dependencies, linting, formatting, et
 openshift-generate: ## Generate and copy CRDs
 	go generate ./...
 	hack/boilerplate.sh
-	cp vendor/sigs.k8s.io/karpenter/pkg/apis/crds/* pkg/apis/crds
+	cp -f $(addprefix vendor/sigs.k8s.io/karpenter/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
+	chmod u+w $(addprefix pkg/apis/crds/,$(KARPENTER_CORE_CRDS))
+	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
+	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
+	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
+	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
+	GOFLAGS=-mod=mod hack/validation/capacitybuffer.sh
 
 openshift-test: ## Run tests
 	go run ./vendor/github.com/onsi/ginkgo/v2/ginkgo -vv \
