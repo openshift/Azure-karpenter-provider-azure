@@ -187,6 +187,10 @@ type AKSNodeClassSpec struct {
 	// ImageID is the ID of the image that instances use.
 	// Not exposed in the API yet
 	ImageID *string `json:"-"`
+	// marketplaceImage selects an Azure Marketplace platform image by publisher/offer/sku/version.
+	// For OpenShift mode, use this for ARO RHCOS images (e.g. azureopenshift/aro4/aro_422-v2/...).
+	// +optional
+	MarketplaceImage *MarketplaceImage `json:"marketplaceImage,omitempty"`
 	// imageFamily is the image family that instances use.
 	// AzureContainerLinux requires an AKS Machine API provision mode with shared image gallery (SIG) access.
 	// Windows node support for the Windows2022 and Windows2025 image families is in preview and
@@ -201,6 +205,12 @@ type AKSNodeClassSpec struct {
 	// If omitted, both versions follow their automatic defaults.
 	// +optional
 	Versions *Versions `json:"versions,omitempty" hash:"ignore"` // Version changes are handled through resolved status and intentionally excluded from the NodeClass hash.
+	// userData is the raw bootstrap payload (e.g. Ignition config for OpenShift) passed as CustomData to the VM.
+	// The provider base64-encodes this internally — provide raw text, not pre-encoded.
+	// When specified in OpenShift mode, this bypasses the default AKS bootstrap script generation.
+	// +kubebuilder:validation:MaxLength=65536
+	// +optional
+	UserData *string `json:"userData,omitempty"`
 	// fipsMode controls FIPS compliance for the provisioned nodes
 	// +optional
 	FIPSMode *FIPSMode `json:"fipsMode,omitempty"`
@@ -306,6 +316,23 @@ type Security struct {
 	// trustedLaunch specifies Trusted Launch settings for provisioned nodes.
 	// +optional
 	TrustedLaunch *TrustedLaunch `json:"trustedLaunch,omitempty"`
+}
+
+// MarketplaceImage selects an Azure Marketplace platform image.
+// +kubebuilder:validation:XValidation:message="publisher, offer, sku and version must all be set",rule="self.publisher != ” && self.offer != ” && self.sku != ” && self.version != ”"
+type MarketplaceImage struct {
+	// publisher is the name of the organization that published the image.
+	// +required
+	Publisher string `json:"publisher"`
+	// offer is the product line of the image.
+	// +required
+	Offer string `json:"offer"`
+	// sku is the specific image flavor.
+	// +required
+	SKU string `json:"sku"`
+	// version is the image build version.
+	// +required
+	Version string `json:"version"`
 }
 
 // +kubebuilder:validation:Enum:={Preferred,Required,Disabled}
@@ -1105,6 +1132,24 @@ func (in *AKSNodeClass) IsTrustedLaunchEnabled() bool {
 func (in *AKSNodeClass) IsFIPSEnabled() bool {
 	return lo.FromPtr(in.Spec.ImageFamily) == Windows2025ImageFamily ||
 		lo.FromPtr(in.Spec.FIPSMode) == FIPSModeFIPS
+}
+
+// HasMarketplaceImage returns true when a complete marketplace image tuple is configured.
+func (in *AKSNodeClass) HasMarketplaceImage() bool {
+	if in.Spec.MarketplaceImage == nil {
+		return false
+	}
+	m := in.Spec.MarketplaceImage
+	return m.Publisher != "" && m.Offer != "" && m.SKU != "" && m.Version != ""
+}
+
+// MarketplaceImageURN returns the standard Publisher:Offer:Sku:Version representation.
+func (in *AKSNodeClass) MarketplaceImageURN() string {
+	if !in.HasMarketplaceImage() {
+		return ""
+	}
+	m := in.Spec.MarketplaceImage
+	return fmt.Sprintf("%s:%s:%s:%s", m.Publisher, m.Offer, m.SKU, m.Version)
 }
 
 // IsArtifactStreamingEnabled returns whether artifact streaming should be enabled for this node class.

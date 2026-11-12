@@ -43,6 +43,7 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 
@@ -118,6 +119,11 @@ func (c *CloudProvider) WaitForInstancePromises() {
 }
 
 func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
+	// OpenShift uses spec marketplaceImage/userData instead of AKS gallery images and bootstrap version.
+	// Still require platform conditions that apply on Azure (subnet, validation).
+	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
+		return validateOpenShiftNodeClass(nodeClass)
+	}
 	if options.FromContext(ctx).EnableFIPS && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
 		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("AKSNodeClass spec.fipsMode must be set to FIPS because FIPS is enabled at the cluster level"))
 	}
@@ -133,6 +139,42 @@ func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta
 	}
 	if _, err := nodeClass.GetImages(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateOpenShiftNodeClass(nodeClass *v1beta1.AKSNodeClass) error {
+	if !nodeClass.HasMarketplaceImage() {
+		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("marketplaceImage is required in OpenShift mode"))
+	}
+	if nodeClass.Spec.UserData == nil || *nodeClass.Spec.UserData == "" {
+		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("userData is required in OpenShift mode"))
+	}
+	for _, conditionType := range []string{
+		v1beta1.ConditionTypeSubnetsReady,
+	} {
+		if err := validateNodeClassCondition(nodeClass, conditionType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateNodeClassCondition(nodeClass *v1beta1.AKSNodeClass, conditionType string) error {
+	cond := nodeClass.StatusConditions().Get(conditionType)
+	if cond.IsFalse() {
+		return cloudprovider.NewNodeClassNotReadyError(stderrors.New(cond.Message))
+	}
+	if cond.IsUnknown() {
+		message := cond.Message
+		if message == "" {
+			message = "condition not yet resolved"
+		}
+		return cloudprovider.NewCreateError(
+			fmt.Errorf("resolving NodeClass readiness, %s is in Ready=Unknown, %s", conditionType, message),
+			NodeClassReadinessUnknownReason,
+			fmt.Sprintf("NodeClass %s is in Ready=Unknown", conditionType),
+		)
 	}
 	return nil
 }

@@ -45,6 +45,9 @@ const (
 	ProvisionModeBootstrappingClient      = "bootstrappingclient"
 	ProvisionModeAKSMachineAPI            = "aksmachineapi"
 	ProvisionModeAKSMachineAPIHeaderBatch = "aksmachineapiheaderbatch"
+	// ProvisionModeOpenShift is for OpenShift/HyperShift clusters where userData (Ignition config)
+	// is provided externally via the NodeClass spec, bypassing all AKS-specific bootstrapping.
+	ProvisionModeOpenShift = "openshift"
 
 	AKSMachineAPIHeaderBatchMaxSize = 50
 
