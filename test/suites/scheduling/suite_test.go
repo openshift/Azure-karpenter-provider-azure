@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	azkarptest "github.com/Azure/karpenter-provider-azure/pkg/test"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/debug"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/azure"
 
@@ -57,7 +59,7 @@ func TestScheduling(t *testing.T) {
 
 var _ = BeforeEach(func() {
 	env.BeforeEach()
-	nodeClass = env.DefaultAKSNodeClass()
+	nodeClass = azkarptest.AKSNodeClass()
 	nodePool = env.DefaultNodePool(nodeClass)
 })
 var _ = AfterEach(func() { env.Cleanup() })
@@ -82,26 +84,28 @@ var _ = Describe("Scheduling", Ordered, ContinueOnFailure, func() {
 			corev1.LabelWindowsBuild,
 			// VM SKU with GPU we are using does not populate this; won't be tested
 			v1beta1.LabelSKUGPUName,
+			// Written onto nodes by the Elastic SAN CSI driver (Azure Container Storage), which the E2E
+			// cluster does not install, so a pod selecting on it would never become Ready here. Its
+			// normalization is covered by the acceptance tests in pkg/providers/instancetype.
+			zones.LabelAzureElasticSANCSIZone,
 		)
 
 		if !env.UsesSharedImageGallery() {
 			// Can't test FIPS if not using SIG
 			selectors.Insert(v1beta1.AKSLabelFIPSEnabled)
 		}
-
-		// If no spec with Label("GPU") ran (e.g., `-label-filter='!GPU'`),
-		// ignore GPU labels in the coverage assertion.
-		if !Label("GPU").MatchesLabelFilter(GinkgoLabelFilter()) {
-			selectors.Insert(
-				v1beta1.LabelSKUGPUCount,
-				v1beta1.LabelSKUGPUManufacturer,
-			)
-		}
-
 	})
 	AfterAll(func() {
-		// Ensure that we're exercising all well known labels (with the above exceptions)
-		Expect(lo.Keys(selectors)).To(ContainElements(append(karpv1.WellKnownLabels.UnsortedList(), lo.Keys(karpv1.NormalizedLabels)...)))
+		// All selector tests are unlabeled except the GPU test, so only require coverage from tests selected by the label filter.
+		expectedSelectors := sets.New(append(karpv1.WellKnownLabels.UnsortedList(), lo.Keys(karpv1.NormalizedLabels)...)...)
+		gpuSelectors := sets.New(v1beta1.LabelSKUGPUCount, v1beta1.LabelSKUGPUManufacturer)
+		if !Label().MatchesLabelFilter(GinkgoLabelFilter()) { // unlabeled tests did not run (were filtered out)
+			expectedSelectors = gpuSelectors // only require GPU selector coverage
+		}
+		if !Label("GPU").MatchesLabelFilter(GinkgoLabelFilter()) { // GPU tests did not run (were filtered out)
+			expectedSelectors = expectedSelectors.Difference(gpuSelectors) // don't require GPU selectors coverage
+		}
+		Expect(selectors.UnsortedList()).To(ContainElements(expectedSelectors.UnsortedList()))
 	})
 
 	It("should apply annotations to the node", func() {
@@ -135,6 +139,7 @@ var _ = Describe("Scheduling", Ordered, ContinueOnFailure, func() {
 				v1beta1.LabelSKUAcceleratedNetworking:     "true",
 				v1beta1.LabelSKUStoragePremiumCapable:     "true",
 				v1beta1.LabelSKUStorageEphemeralOSMaxSize: "53",
+				v1beta1.LabelUltraSSD:                     "false",
 				v1beta1.AKSLabelCluster:                   env.NodeResourceGroup,
 				v1beta1.AKSLabelMode:                      "system",
 				v1beta1.AKSLabelScaleSetPriority:          "regular",
@@ -181,7 +186,7 @@ var _ = Describe("Scheduling", Ordered, ContinueOnFailure, func() {
 				// Deprecated Labels
 				corev1.LabelFailureDomainBetaRegion: env.Region,
 				corev1.LabelFailureDomainBetaZone:   fmt.Sprintf("%s-1", env.Region),
-				"topology.disk.csi.azure.com/zone":  fmt.Sprintf("%s-1", env.Region),
+				zones.LabelAzureDiskCSIZone:         fmt.Sprintf("%s-1", env.Region),
 				"beta.kubernetes.io/arch":           "amd64",
 				"beta.kubernetes.io/os":             "linux",
 			}
@@ -266,6 +271,28 @@ var _ = Describe("Scheduling", Ordered, ContinueOnFailure, func() {
 				NodePreferences:  requirements,
 				NodeRequirements: requirements,
 			}})
+			env.ExpectCreated(nodeClass, nodePool, deployment)
+			env.EventuallyExpectHealthyDeployment(deployment)
+			env.ExpectCreatedNodeCount("==", 1)
+		})
+
+		It("should support Kata VM isolation label for instance type selection", func() {
+			selectors.Insert(v1beta1.AKSLabelKataVMIsolation)
+			if !env.IsMachineModeOrNPS() {
+				Skip("Kata Pod Sandboxing is not supported on the aksscriptless provision mode")
+			}
+
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
+			nodeClass.Spec.WorkloadRuntime = lo.ToPtr(v1beta1.WorkloadRuntimeKataVMIsolation)
+			deployment := test.Deployment(
+				test.DeploymentOptions{
+					Replicas: 1,
+					PodOptions: test.PodOptions{
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable:  "Standard_D4s_v5",
+							v1beta1.AKSLabelKataVMIsolation: "true",
+						},
+					}})
 			env.ExpectCreated(nodeClass, nodePool, deployment)
 			env.EventuallyExpectHealthyDeployment(deployment)
 			env.ExpectCreatedNodeCount("==", 1)

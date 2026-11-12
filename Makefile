@@ -5,8 +5,6 @@ LDFLAGS ?= -ldflags=-X=sigs.k8s.io/karpenter/pkg/operator.Version=$(shell git de
 
 GOFLAGS ?= $(LDFLAGS)
 
-BUILD_DEST ?= bin/azure-karpenter-provider
-
 # # CR for local builds of Karpenter
 KARPENTER_NAMESPACE ?= kube-system
 
@@ -14,6 +12,12 @@ KARPENTER_NAMESPACE ?= kube-system
 # TODO: revisit testing tools (temporarily excluded here, for make verify)
 MOD_DIRS = $(shell find . -name go.mod -type f ! -path "./test/*" | xargs dirname)
 KARPENTER_CORE_DIR = $(shell go list -m -f '{{ .Dir }}' sigs.k8s.io/karpenter)
+KARPENTER_CORE_CRDS = \
+	autoscaling.x-k8s.io_capacitybuffers.yaml \
+	karpenter.sh_nodeclaims.yaml \
+	karpenter.sh_nodeoverlays.yaml \
+	karpenter.sh_nodepools.yaml
+SUPPORTED_CRDS = karpenter.azure.com_aksnodeclasses.yaml $(KARPENTER_CORE_CRDS)
 
 # TEST_SUITE enables you to select a specific test suite directory to run "make e2etests" or "make test" against
 TEST_SUITE ?= "..."
@@ -23,9 +27,6 @@ LABEL_FILTER ?=
 
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
-
-build: ## Build the controller binary
-	go build -o $(BUILD_DEST) $(GOFLAGS) ./cmd/controller
 
 presubmit: verify test ## Run all steps in the developer loop
 
@@ -95,12 +96,19 @@ verify: tidy download ## Verify code. Includes dependencies, linting, formatting
 	make az-swagger-generate-clients-raw
 	go generate ./...
 	hack/boilerplate.sh
-	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
+	# Copy pinned core CRDs and make the local copies writable
+	cp -f $(addprefix $(KARPENTER_CORE_DIR)/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
+	chmod u+w $(addprefix pkg/apis/crds/,$(KARPENTER_CORE_CRDS))
+	# Apply provider-specific CRD changes before packaging them
 	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
+	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
+	# Package the adjusted CRDs, then validate CapacityBuffer chart delivery
+	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
+	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
+	hack/validation/capacitybuffer.sh
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
 	@git diff --quiet ||\
@@ -122,15 +130,19 @@ licenses: download ## Verifies dependency licenses
 	go-licenses csv ./... > $$LICENSEFILE && \
 	! grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0' $$LICENSEFILE
 
-codegen: codegen-pricing codegen-locations codegen-skugen codegen-allazureskus ## Auto generate files based on Azure API responses
+codegen: codegen-prod codegen-test ## Auto generate files based on Azure API responses
 
-codegen-pricing: ## Generate pricing data
+codegen-prod: codegen-pricing codegen-allazuresku ## Generate codegen data used in production
+
+codegen-test: codegen-locations codegen-skugen ## Generate codegen test data
+
+codegen-pricing: ## Generate pricing data -- if regenerating, all subs should have same view as the API used is not per-sub
 	./hack/codegen.sh pricing
 
 codegen-locations: ## Generate locations data
 	./hack/codegen.sh locations
 
-codegen-skugen: ## Generate SKU test fakes
+codegen-skugen: ## Generate SKU test fakes - recommended to use the ACS - Test (Standalone) subscription for this
 	./hack/codegen.sh skugen
 
 codegen-allazureskus: ## Generate all Azure VM SKU names
@@ -151,47 +163,29 @@ tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
 download: ## Recursively "go mod download" on all directories where go.mod exists
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
 
-openshift-toolchain:
-	./openshift/toolchain.sh
-
-openshift-verify: ## Verify code. Includes dependencies, linting, formatting, etc
-	go generate ./...
-	hack/boilerplate.sh
-	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
-	hack/validation/labels.sh
-	hack/validation/requirements.sh
-	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
-	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
-	@git diff --quiet ||\
-		{ echo "New file modification detected in the Git working tree. Please check in before commit."; git --no-pager diff --name-only | uniq | awk '{print "  - " $$0}'; \
-		if [ "${CI}" = true ]; then\
-			exit 1;\
-		fi;}
-	actionlint -oneline
-
-openshift-generate: ## Generate and copy CRDs
-	go generate ./...
-	hack/boilerplate.sh
-	cp vendor/sigs.k8s.io/karpenter/pkg/apis/crds/* pkg/apis/crds
-	hack/validation/labels.sh
-	hack/validation/requirements.sh
-	hack/mutation/kubectl_get_ux.sh
-	cp pkg/apis/crds/* charts/karpenter-crd/templates
-
-openshift-test: ## Run tests
-	go run ./vendor/github.com/onsi/ginkgo/v2/ginkgo -vv \
-		-cover -coverprofile=coverage.out -output-dir=. -coverpkg=./pkg/... \
-		--focus="${FOCUS}" \
-		--randomize-all \
-		./pkg/...
-
-openshift-lint-fix: ## Golangci-lint-custom fix
-	golangci-lint-custom run
-
-.PHONY: help build presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download openshift-toolchain openshift-verify openshift-generate openshift-test openshift-lint-fix
+.PHONY: help presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download
 
 define newline
 
 
 endef
+
+# Announce all explicit targets as they run to allow easier tracing of issues
+#
+# Every target is preceded by a blank line and a header like this:
+# ----- <target> ----
+#
+# NOTE: This block must be at the very end of the entrypoint Makefile so it's parsed last
+
+ANNOUNCED_TARGETS := $(filter-out FORCE .PHONY,$(shell awk -F: \
+    '/^[a-zA-Z0-9_.\/-]+([[:space:]]+[a-zA-Z0-9_.\/-]+)*[[:space:]]*:/ \
+    { print $$1 }' $(MAKEFILE_LIST)))
+
+.PHONY: FORCE
+
+$(ANNOUNCED_TARGETS): %: | .announce-%
+
+.announce-%: FORCE
+	@printf '\n----- %s -----\n' '$*'
+
+FORCE:

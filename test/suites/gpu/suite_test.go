@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	azkarptest "github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/azure"
 )
 
@@ -101,30 +102,17 @@ var _ = Describe("GPU", func() {
 			)
 			env.ExpectCreatedNodeCount("==", int(*deployment.Spec.Replicas))
 		},
-		Entry("should provision one GPU Node and one GPU Pod (AzureLinux)", env.AZLinuxNodeClass()),
-		Entry("should provision one GPU Node and one GPU Pod (Ubuntu)", func() *v1beta1.AKSNodeClass { // This ensures the case statement for GPU Filtering covers the generic Ubuntu Image family
-			nodeClass := env.DefaultAKSNodeClass()
-			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
-			return nodeClass
-
-		}()),
-		Entry("should provision one GPU Node and one GPU Pod (Ubuntu2204)", func() *v1beta1.AKSNodeClass {
-			nodeClass := env.DefaultAKSNodeClass()
-			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2204ImageFamily)
-			return nodeClass
-		}()),
-		Entry("should provision one GPU Node and one GPU Pod (Ubuntu2404)", func() *v1beta1.AKSNodeClass {
-			nodeClass := env.DefaultAKSNodeClass()
-			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.Ubuntu2404ImageFamily)
-			return nodeClass
-		}()),
+		Entry("should provision one GPU Node and one GPU Pod (AzureLinux)", azkarptest.AKSNodeClass(azkarptest.WithImageFamily(v1beta1.AzureLinuxImageFamily))),
+		Entry("should provision one GPU Node and one GPU Pod (Ubuntu)", azkarptest.AKSNodeClass(azkarptest.WithImageFamily(v1beta1.UbuntuImageFamily))),
+		Entry("should provision one GPU Node and one GPU Pod (Ubuntu2204)", azkarptest.AKSNodeClass(azkarptest.WithImageFamily(v1beta1.Ubuntu2204ImageFamily))),
+		Entry("should provision one GPU Node and one GPU Pod (Ubuntu2404)", azkarptest.AKSNodeClass(azkarptest.WithImageFamily(v1beta1.Ubuntu2404ImageFamily))),
 	)
 
 	It("should provision a GPU node with mode None",
 		Label("GPU"),
 		func() {
 			noneMode := v1beta1.GPUModeNone
-			nodeClass := env.DefaultAKSNodeClass()
+			nodeClass := azkarptest.AKSNodeClass()
 			nodeClass.Spec.GPU = &v1beta1.GPU{Mode: &noneMode}
 
 			nodePool := env.DefaultNodePool(nodeClass)
@@ -226,7 +214,7 @@ func createNVIDIADevicePluginDaemonSet() *appsv1.DaemonSet {
 					Containers: []corev1.Container{
 						{
 							Name:  "nvidia-device-plugin-ctr",
-							Image: "nvcr.io/nvidia/k8s-device-plugin:v0.14.1",
+							Image: "nvcr.io/nvidia/k8s-device-plugin:v0.20.0",
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: lo.ToPtr(false),
 								Capabilities: &corev1.Capabilities{

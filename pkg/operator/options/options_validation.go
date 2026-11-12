@@ -48,6 +48,7 @@ func (o *Options) Validate() error {
 		o.validateAdditionalTags(),
 		o.validateDiskEncryptionSetID(),
 		o.validateClusterDNSIP(),
+		o.validateComputeRecommendationMode(),
 		validate.Struct(o),
 	)
 }
@@ -117,9 +118,8 @@ func (o *Options) validateVMMemoryOverheadPercent() error {
 	return nil
 }
 
-//nolint:gocyclo
 func (o *Options) validateProvisionMode() error {
-	if o.ProvisionMode != consts.ProvisionModeAKSScriptless && o.ProvisionMode != consts.ProvisionModeBootstrappingClient && o.ProvisionMode != consts.ProvisionModeOpenShift && !o.IsAKSMachineAPIMode() {
+	if o.ProvisionMode != consts.ProvisionModeAKSScriptless && o.ProvisionMode != consts.ProvisionModeBootstrappingClient && !o.IsAKSMachineAPIMode() {
 		return fmt.Errorf("provision-mode is invalid: %s", o.ProvisionMode)
 	}
 	switch o.ProvisionMode {
@@ -166,12 +166,10 @@ func (o *Options) validateRequiredFields() error {
 	if o.ClusterName == "" {
 		return fmt.Errorf("missing field, cluster-name")
 	}
-	// OpenShift mode gets kubelet bootstrap config from Ignition, not from AKS bootstrap token
-	if o.KubeletClientTLSBootstrapToken == "" && o.ProvisionMode != consts.ProvisionModeOpenShift {
+	if o.KubeletClientTLSBootstrapToken == "" {
 		return fmt.Errorf("missing field, kubelet-bootstrap-token")
 	}
-	// OpenShift nodes get SSH access from Ignition, not the operator SSH key
-	if o.SSHPublicKey == "" && o.ProvisionMode != consts.ProvisionModeOpenShift {
+	if o.SSHPublicKey == "" {
 		return fmt.Errorf("missing field, ssh-public-key")
 	}
 	if o.SubnetID == "" {
@@ -283,4 +281,15 @@ func (o *Options) validateDiskEncryptionSetID() error {
 
 	o.ParsedDiskEncryptionSetID = parsedID
 	return nil
+}
+
+func (o *Options) validateComputeRecommendationMode() error {
+	switch o.ComputeRecommendationMode {
+	case consts.ComputeRecommendationModeDisabled,
+		consts.ComputeRecommendationModeLog,
+		consts.ComputeRecommendationModeEnabled:
+		return nil
+	default:
+		return fmt.Errorf("compute-recommendation-mode %q is invalid, must be one of 'disabled', 'log-only', or 'enabled'", o.ComputeRecommendationMode)
+	}
 }

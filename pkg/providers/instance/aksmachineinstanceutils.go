@@ -96,11 +96,13 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	annotations := map[string]string{}
 
 	annotations[v1beta1.AnnotationAKSMachineResourceID] = aksMachineResourceID
+	annotations[v1beta1.AnnotationCapacityReservationGroupID] = capacityReservationGroupIDFromAKSMachine(aksMachineTemplate)
 	if instanceType != nil {
 		labels = labelspkg.GetAllSingleValuedRequirementLabels(instanceType.Requirements)
 		nodeClaim.Status.Capacity = lo.PickBy(instanceType.Capacity, func(_ corev1.ResourceName, v resource.Quantity) bool { return !resources.IsZero(v) })
 		nodeClaim.Status.Allocatable = lo.PickBy(instanceType.Allocatable(), func(_ corev1.ResourceName, v resource.Quantity) bool { return !resources.IsZero(v) })
 	}
+
 	if zone != nil {
 		labels[corev1.LabelTopologyZone] = *zone
 		labels[v1beta1.LabelPlacementScope] = zones.PlacementScopeForZone(*zone)
@@ -108,6 +110,7 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	labels[karpv1.CapacityTypeLabelKey] = capacityType
 	labels[v1beta1.AKSLabelScaleSetPriority] = KarpCapacityTypeToScaleSetPriorityLabel[capacityType]
 	labels[v1beta1.AKSLabelPriority] = KarpCapacityTypeToPriorityLabel[capacityType]
+	labels[v1beta1.LabelUltraSSD] = ultraSSDLabelFromAKSMachineTemplate(aksMachineTemplate)
 	if tag, ok := aksMachineTemplate.Properties.Tags[launchtemplate.NodePoolTagKey]; ok {
 		labels[karpv1.NodePoolLabelKey] = *tag
 	}
@@ -137,6 +140,20 @@ func BuildNodeClaimFromAKSMachineTemplate(
 	return nodeClaim, nil
 }
 
+func capacityReservationGroupIDFromAKSMachine(aksMachine *armcontainerservice.Machine) string {
+	if aksMachine == nil ||
+		aksMachine.Properties == nil ||
+		aksMachine.Properties.CapacityReservation == nil ||
+		aksMachine.Properties.CapacityReservation.CapacityReservationGroup == nil {
+		return ""
+	}
+	return lo.FromPtr(aksMachine.Properties.CapacityReservation.CapacityReservationGroup.ID)
+}
+
+func ultraSSDLabelFromAKSMachineTemplate(aksMachineTemplate *armcontainerservice.Machine) string {
+	return fmt.Sprint(aksMachineTemplate != nil && aksMachineTemplate.Properties != nil && aksMachineTemplate.Properties.Hardware != nil && lo.FromPtr(aksMachineTemplate.Properties.Hardware.UltraSsdEnabled))
+}
+
 // Expect AKS machine struct to be fully populated as if it comes from GET.
 // Not assuming that NodeClaim exists.
 func BuildNodeClaimFromAKSMachine(ctx context.Context, aksMachine *armcontainerservice.Machine, possibleInstanceTypes []*corecloudprovider.InstanceType, aksMachineLocation string) (*karpv1.NodeClaim, error) {
@@ -149,7 +166,7 @@ func BuildNodeClaimFromAKSMachine(ctx context.Context, aksMachine *armcontainers
 		return nil, fmt.Errorf("failed to get zone for AKS machine %q: %w", lo.FromPtr(aksMachine.Name), err)
 	}
 
-	return BuildNodeClaimFromAKSMachineTemplate(
+	nodeClaim, err := BuildNodeClaimFromAKSMachineTemplate(
 		ctx,
 		aksMachine,
 		offerings.GetInstanceTypeFromVMSize(lo.FromPtr(aksMachine.Properties.Hardware.VMSize), possibleInstanceTypes),
@@ -161,6 +178,13 @@ func BuildNodeClaimFromAKSMachine(ctx context.Context, aksMachine *armcontainers
 		lo.FromPtr(aksMachine.Properties.NodeImageVersion), // Empty: not fatal, no need to check
 		lo.FromPtr(aksMachine.Properties.Status.CreationTimestamp),
 	)
+	if err != nil {
+		return nil, err
+	}
+	if aksMachine.Properties.Status.VMState != nil {
+		nodeClaim.Annotations[v1beta1.AnnotationAKSMachineVMState] = string(*aksMachine.Properties.Status.VMState)
+	}
+	return nodeClaim, nil
 }
 
 // May return apimachinery.NotFoundError if NodePool is not found.
@@ -181,11 +205,46 @@ func FindNodePoolFromAKSMachine(ctx context.Context, aksMachine *armcontainerser
 // ASSUMPTION: NodeClaim name is in the format of <NodePool name>-<hash suffix>
 // If total length exceeds AKS machine name limit, the exceeded part will be replaced with another deterministic hash.
 // E.g., "thisisalongnodepoolname-a1b2c" --> "thisisalongnoz9y8x7-a1b2c"
-func GetAKSMachineNameFromNodeClaimName(nodeClaimName string) (string, error) {
-	const maxAKSMachineNameLength = 34 // Defined by AKS machine API.
-	const prefixHashLength = 6         // The length of the hashed part replacing the exceeded part of the prefix.
-	// If 6, given alphanumeric hash, there will be a total of 36^6 = 2,176,782,336 combinations.
+const (
+	// maxAKSMachineNameLength is the maximum AKS machine name length defined by the AKS machine API.
+	maxAKSMachineNameLength = 34
 
+	reservedNAPMachinesPoolName  = "aksmanagedap"
+	linuxPrefixHashLength        = 6
+	windowsNodePoolHashLength    = 6
+	windowsNodeClaimSuffixLength = 5
+)
+
+// GetWindowsAKSMachineName derives a Windows AKS machine name from the NodeClaim name.
+// Managed NAP pools have a 12-character budget and use a six-character hash of the full
+// NodePool name plus the existing five-character NodeClaim suffix. Custom pools have only
+// a five-character budget and use the existing NodeClaim suffix directly.
+func GetWindowsAKSMachineName(nodeClaimName, machinesPoolName string) (string, error) {
+	lastDash := strings.LastIndex(nodeClaimName, "-")
+	if lastDash <= 0 {
+		return "", fmt.Errorf("invalid NodeClaim name format: no NodePool prefix found in %q", nodeClaimName)
+	}
+	nodePoolPrefix := nodeClaimName[:lastDash]
+	nodeClaimSuffix := nodeClaimName[lastDash+1:]
+	if len(nodeClaimSuffix) != windowsNodeClaimSuffixLength {
+		return "", fmt.Errorf("invalid NodeClaim name suffix %q, expected %d characters", nodeClaimSuffix, windowsNodeClaimSuffixLength)
+	}
+
+	if machinesPoolName != reservedNAPMachinesPoolName {
+		return nodeClaimSuffix, nil
+	}
+
+	nodePoolHash, err := utils.GetAlphanumericHash(nodePoolPrefix, windowsNodePoolHashLength)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash NodePool prefix %q for Windows AKS machine name: %w", nodePoolPrefix, err)
+	}
+	return nodePoolHash + "-" + nodeClaimSuffix, nil
+}
+
+// GetLinuxAKSMachineName derives a valid AKS machine name (<= 34 chars) from a NodeClaim name for Linux.
+// Names within the limit are used verbatim; longer names keep the legible prefix and trailing suffix and
+// hash the overflowing middle so the result stays deterministic and collision-resistant.
+func GetLinuxAKSMachineName(nodeClaimName string) (string, error) {
 	if len(nodeClaimName) <= maxAKSMachineNameLength {
 		// Safe to use the whole name
 		return nodeClaimName, nil
@@ -200,10 +259,10 @@ func GetAKSMachineNameFromNodeClaimName(nodeClaimName string) (string, error) {
 	// Keep the legit part of the prefix intact, but hash the rest
 	// ASSUMPTION: prefix length is at least 6 characters at this point (which means suffix length is not too large)
 	// At the time of writing, suffix length is 6 (e.g., "-a1b2c"). This is unlikely to change.
-	keepPrefixLength := maxAKSMachineNameLength - len(suffix) - prefixHashLength
+	keepPrefixLength := maxAKSMachineNameLength - len(suffix) - linuxPrefixHashLength
 	prefixToKeep := prefix[:keepPrefixLength]
 	prefixToHash := prefix[keepPrefixLength:]
-	hashedPrefixToHash, err := utils.GetAlphanumericHash(prefixToHash, 6)
+	hashedPrefixToHash, err := utils.GetAlphanumericHash(prefixToHash, linuxPrefixHashLength)
 	if err != nil {
 		return "", fmt.Errorf("failed to hash exceeded AKS machine name prefix %q: %w", prefixToHash, err)
 	}

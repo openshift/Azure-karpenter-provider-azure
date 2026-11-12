@@ -43,7 +43,7 @@ import (
 type Template struct {
 	ScriptlessCustomData      string
 	ImageID                   string
-	MarketplaceImage          *v1beta1.MarketplaceImage
+	EnableFIPS1403Encryption  bool
 	SubnetID                  string
 	Tags                      map[string]*string
 	CustomScriptsCustomData   string
@@ -53,9 +53,6 @@ type Template struct {
 	StorageProfileIsEphemeral bool
 	StorageProfilePlacement   armcompute.DiffDiskPlacement
 	StorageProfileSizeGB      int32
-	// OpenShiftUserData is raw userData from the NodeClass (e.g. Ignition config).
-	// The VM provider base64-encodes this before sending it as Azure CustomData.
-	OpenShiftUserData string
 }
 
 type Provider struct {
@@ -117,15 +114,6 @@ func (p *Provider) GetTemplate(
 	instanceType *cloudprovider.InstanceType,
 	additionalLabels map[string]string,
 ) (*Template, error) {
-	if p.provisionMode == consts.ProvisionModeOpenShift {
-		launchTemplate, err := p.getOpenShiftTemplate(ctx, nodeClass)
-		if err != nil {
-			return nil, err
-		}
-		launchTemplate.Tags = Tags(options.FromContext(ctx), nodeClass, nodeClaim)
-		return launchTemplate, nil
-	}
-
 	staticParameters, err := p.getStaticParameters(ctx, instanceType, nodeClass, lo.Assign(nodeClaim.Labels, additionalLabels))
 	if err != nil {
 		return nil, err
@@ -165,7 +153,7 @@ func (p *Provider) getStaticParameters(
 	}
 
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
-	baseLabels, err := karplabels.Get(ctx, nodeClass, arch)
+	baseLabels, err := karplabels.Get(ctx, nodeClass, arch, instanceType.Requirements)
 	if err != nil {
 		return nil, err
 	}
@@ -222,33 +210,12 @@ func getAgentbakerNetworkPlugin(ctx context.Context) string {
 	return consts.NetworkPluginAzure
 }
 
-// getOpenShiftTemplate creates a simplified template for OpenShift mode.
-// It uses marketplaceImage and userData directly from the nodeClass, bypassing AKS-specific bootstrap.
-//
-//nolint:unparam
-func (p *Provider) getOpenShiftTemplate(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (*Template, error) {
-	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
-
-	template := &Template{
-		SubnetID: subnetID,
-	}
-
-	if nodeClass.HasMarketplaceImage() {
-		template.MarketplaceImage = nodeClass.Spec.MarketplaceImage.DeepCopy()
-	}
-
-	if nodeClass.Spec.UserData != nil && *nodeClass.Spec.UserData != "" {
-		template.OpenShiftUserData = *nodeClass.Spec.UserData
-	}
-
-	return template, nil
-}
-
 // ATTENTION!!!: changes here may NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
 // Refactoring for code unification is not being invested immediately.
 func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.Parameters) (*Template, error) {
 	template := &Template{
 		ImageID:                   params.ImageID,
+		EnableFIPS1403Encryption:  params.EnableFIPS1403Encryption,
 		SubnetID:                  params.SubnetID,
 		IsWindows:                 params.IsWindows,
 		StorageProfileDiskType:    params.StorageProfileDiskType,

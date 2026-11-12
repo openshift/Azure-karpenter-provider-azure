@@ -43,7 +43,6 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
-	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 
@@ -88,6 +87,7 @@ type CloudProvider struct {
 	recorder                   events.Recorder
 	instanceTypeStore          *nodeoverlay.InstanceTypeStore
 	instancePromiseWg          sync.WaitGroup
+	legacyRepairPolicies       bool
 }
 
 func New(
@@ -98,6 +98,7 @@ func New(
 	kubeClient client.Client,
 	imageProvider imagefamily.NodeImageProvider,
 	store *nodeoverlay.InstanceTypeStore,
+	legacyRepairPolicies bool,
 ) *CloudProvider {
 	return &CloudProvider{
 		instanceTypeProvider:       instanceTypeProvider,
@@ -107,6 +108,7 @@ func New(
 		imageProvider:              imageProvider,
 		recorder:                   recorder,
 		instanceTypeStore:          store,
+		legacyRepairPolicies:       legacyRepairPolicies,
 	}
 }
 
@@ -116,10 +118,8 @@ func (c *CloudProvider) WaitForInstancePromises() {
 }
 
 func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
-	// OpenShift uses spec marketplaceImage/userData instead of AKS gallery images and bootstrap version.
-	// Still require platform conditions that apply on Azure (subnet, validation).
-	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
-		return validateOpenShiftNodeClass(nodeClass)
+	if options.FromContext(ctx).EnableFIPS && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
+		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("AKSNodeClass spec.fipsMode must be set to FIPS because FIPS is enabled at the cluster level"))
 	}
 	nodeClassReady := nodeClass.StatusConditions().Get(status.ConditionReady)
 	if nodeClassReady.IsFalse() {
@@ -133,42 +133,6 @@ func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta
 	}
 	if _, err := nodeClass.GetImages(); err != nil {
 		return err
-	}
-	return nil
-}
-
-func validateOpenShiftNodeClass(nodeClass *v1beta1.AKSNodeClass) error {
-	if !nodeClass.HasMarketplaceImage() {
-		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("marketplaceImage is required in OpenShift mode"))
-	}
-	if nodeClass.Spec.UserData == nil || *nodeClass.Spec.UserData == "" {
-		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("userData is required in OpenShift mode"))
-	}
-	for _, conditionType := range []string{
-		v1beta1.ConditionTypeSubnetsReady,
-	} {
-		if err := validateNodeClassCondition(nodeClass, conditionType); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateNodeClassCondition(nodeClass *v1beta1.AKSNodeClass, conditionType string) error {
-	cond := nodeClass.StatusConditions().Get(conditionType)
-	if cond.IsFalse() {
-		return cloudprovider.NewNodeClassNotReadyError(stderrors.New(cond.Message))
-	}
-	if cond.IsUnknown() {
-		message := cond.Message
-		if message == "" {
-			message = "condition not yet resolved"
-		}
-		return cloudprovider.NewCreateError(
-			fmt.Errorf("resolving NodeClass readiness, %s is in Ready=Unknown, %s", conditionType, message),
-			NodeClassReadinessUnknownReason,
-			fmt.Sprintf("NodeClass %s is in Ready=Unknown", conditionType),
-		)
 	}
 	return nil
 }
@@ -198,7 +162,8 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		return nil, err
 	}
 
-	// Note: This filters out any instance types which we're out of capacity for
+	// Filter static requirement and resource incompatibilities here. Offering availability is
+	// checked by the instance provider after it first gets a chance to reuse an existing resource.
 	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), InstanceTypeResolutionFailedReason, truncateMessage(err.Error()))
@@ -218,7 +183,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) (*karpv1.NodeClaim, error) {
 	vmPromise, err := c.vmInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+		return nil, toCreateError(err, "creating instance failed")
 	}
 
 	if err := c.handleInstancePromise(ctx, vmPromise, nodeClaim); err != nil {
@@ -252,7 +217,7 @@ func (c *CloudProvider) createAKSMachineInstance(ctx context.Context, nodeClass 
 	// Begin the creation of the instance
 	aksMachinePromise, err := c.aksMachineInstanceProvider.BeginCreate(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating AKS machine failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+		return nil, toCreateError(err, "creating AKS machine failed")
 	}
 
 	// Handle the promise
@@ -300,8 +265,9 @@ func (c *CloudProvider) handleInstancePromise(ctx context.Context, instancePromi
 		err := instancePromise.Wait()
 		if err != nil {
 			c.handleInstancePromiseWaitError(ctx, instancePromise, nodeClaim, err)
-			return cloudprovider.NewCreateError(fmt.Errorf("creating standalone instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
+			return toCreateError(err, "creating standalone instance failed")
 		}
+		return nil
 	}
 	// For NodePool-managed nodeclaims, launch a single goroutine to poll the returned promise.
 	// Note that we could store the LRO details on the NodeClaim, but we don't bother today because Karpenter
@@ -407,10 +373,40 @@ func (c *CloudProvider) waitUntilLaunched(ctx context.Context, nodeClaim *karpv1
 }
 
 func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	return c.list(ctx)
+}
+
+type listOptions struct {
+	includeAKSMachineVMState bool
+}
+
+type listOption func(*listOptions)
+
+func withAKSMachineVMState() listOption {
+	return func(options *listOptions) {
+		options.includeAKSMachineVMState = true
+	}
+}
+
+// ListWithAKSMachineVMState lists cloud instances while requesting the VM state field for AKS Machines.
+func (c *CloudProvider) ListWithAKSMachineVMState(ctx context.Context) ([]*karpv1.NodeClaim, error) {
+	return c.list(ctx, withAKSMachineVMState())
+}
+
+func (c *CloudProvider) list(ctx context.Context, opts ...listOption) ([]*karpv1.NodeClaim, error) {
+	options := &listOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	var nodeClaims []*karpv1.NodeClaim
 
 	// List AKS machine-based nodes
-	aksMachineInstances, err := c.aksMachineInstanceProvider.List(ctx)
+	var aksMachineOptions []instance.Option
+	if options.includeAKSMachineVMState {
+		aksMachineOptions = append(aksMachineOptions, instance.WithMachineVMStateExpansion())
+	}
+	aksMachineInstances, err := c.aksMachineInstanceProvider.List(ctx, aksMachineOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("listing AKS machine instances, %w", err)
 	}
@@ -507,15 +503,14 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 
 	// AKS machine-based node
 	if aksMachineName, isAKSMachine := instance.GetAKSMachineNameFromNodeClaim(nodeClaim); isAKSMachine {
-		return c.aksMachineInstanceProvider.Delete(ctx, aksMachineName)
+		return c.aksMachineInstanceProvider.Delete(ctx, nodeClaim, aksMachineName)
 	}
 
-	// VM-based node
 	vmName, err := nodeclaimutils.GetVMName(nodeClaim.Status.ProviderID)
 	if err != nil {
 		return fmt.Errorf("getting VM name, %w", err)
 	}
-	return c.vmInstanceProvider.Delete(ctx, vmName)
+	return c.vmInstanceProvider.Delete(ctx, nodeClaim, vmName)
 }
 
 // IsDrifted checks if the NodeClaim has drifted from our goal state.
@@ -562,38 +557,97 @@ func (c *CloudProvider) Name() string {
 	return "azure"
 }
 
+func (c *CloudProvider) Reboot(context.Context, *karpv1.NodeClaim, string) error {
+	return cloudprovider.NewNodeRebootNotImplementedError()
+}
+
 func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 	return []status.Object{&v1beta1.AKSNodeClass{}}
 }
 
-// TODO: review repair policies
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
+	if c.legacyRepairPolicies {
+		return legacyRepairPolicies()
+	}
+	return budgetAwareRepairPolicies()
+}
+
+func legacyRepairPolicies() []cloudprovider.RepairPolicy {
+	// Keep the pre-v1.15 policy profile independent of future recovery choices.
 	return []cloudprovider.RepairPolicy{
-		// Supported Kubelet fields
 		{
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionFalse,
 			TolerationDuration: 10 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionUnknown,
 			TolerationDuration: 10 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      "kubernetes.azure.com/NodeHealthy",
 			ConditionStatus:    corev1.ConditionFalse,
 			TolerationDuration: 0,
+			Action:             cloudprovider.ReplaceNode,
 		},
-		// Fast-path repair for Azure Spot VMs that received a platform eviction signal.
-		// The condition is emitted by a node-level agent that polls the Instance Metadata
-		// Service for SpotRebalanceRecommendation / Preempt events. Spot eviction notice
-		// is ~30s, so toleration is 0 — we want to start the replacement immediately
-		// rather than waiting for the NodeReady=Unknown 10-minute backstop.
 		{
 			ConditionType:      SpotConditionPreemptionScheduled,
 			ConditionStatus:    corev1.ConditionTrue,
 			TolerationDuration: 0,
+			Action:             cloudprovider.ReplaceNode,
+		},
+	}
+}
+
+func budgetAwareRepairPolicies() []cloudprovider.RepairPolicy {
+	// Start with legacy eligibility and forceful drains; policy changes remain opt-in future work.
+	// Possible per-reason extensions, only after validating Azure signals:
+	//   TerminationGracePeriod: lo.ToPtr(5 * time.Minute), // bounded drain for a responsive node
+	//   Priority:               50,                     // higher urgency, not a budget bypass
+	//   Action:                 cloudprovider.RebootNode, // requires supported Azure reboot operations
+	// Replace overlapping catch-all policies when splitting reasons: an eligible replacement wins over reboot.
+	return []cloudprovider.RepairPolicy{
+		// Supported Kubelet fields
+		{
+			// The sole default fallback; the other conditions match every reason explicitly.
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionFalse,
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			ReasonRegex:            ".*",
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		{
+			ConditionType:          "kubernetes.azure.com/NodeHealthy",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     0,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
+		},
+		// Fast-path repair for Azure Spot VMs that received a platform eviction signal.
+		// The condition is emitted by a node-level agent that polls the Instance Metadata
+		// Service for SpotRebalanceRecommendation / Preempt events. Spot eviction notice
+		// is ~30s, so toleration is 0 — we want repair to become eligible immediately
+		// rather than waiting for the NodeReady=Unknown 10-minute backstop.
+		// Budgets and replacement initialization can still delay termination.
+		{
+			ConditionType:          SpotConditionPreemptionScheduled,
+			ConditionStatus:        corev1.ConditionTrue,
+			ReasonRegex:            ".*",
+			TolerationDuration:     0,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 	}
 }
@@ -612,6 +666,7 @@ func (c *CloudProvider) resolveNodeClassFromNodePool(ctx context.Context, nodePo
 	}
 	return nodeClass, nil
 }
+
 func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) ([]*cloudprovider.InstanceType, error) {
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
@@ -626,10 +681,18 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
 		}
 	}
 
+	// Filter instance type compatibility here, so we avoid considering instance types that
+	// cannot satisfy the node claim's requirements and resource requests.
+	// Note that offering availability is checked in pkg/providers/allocationstrategy/allocation_strategy.go
+	// NOT here. That is because availability can change moment to moment due to things like quota/capacity, but
+	// we need to still consider instance types in case of something like NodeClaim recreate (to make CloudProvider.Create idempotent)
+	// If we consider availability here, we may filter out the instance type that we actually previously created.
+	// Then a subsequent call to Create will not adopt the already-created instance because it was filtered out here due to max quota (for example),
+	// even though since we aren't actually creating a NEW VM, for the purposes of adopting an existing VM to a NodeClaim availability doesn't matter.
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	return lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
 		return reqs.Compatible(i.Requirements, v1beta1.AllowUndefinedWellKnownAndRestrictedLabels) == nil &&
-			len(i.Offerings.Compatible(reqs).Available()) > 0 &&
+			len(i.Offerings.Compatible(reqs)) > 0 &&
 			resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
 	}), nil
 
@@ -697,6 +760,8 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 	labels[karpv1.CapacityTypeLabelKey] = instance.GetCapacityTypeFromVM(vm)
 	labels[v1beta1.AKSLabelScaleSetPriority] = instance.GetScaleSetPriorityLabelFromVM(vm)
 	labels[v1beta1.AKSLabelPriority] = instance.GetPriorityLabelFromVM(vm)
+	labels[v1beta1.LabelUltraSSD] = fmt.Sprint(instance.GetUltraSSDEnabled(vm))
+	annotations[v1beta1.AnnotationCapacityReservationGroupID] = instance.CapacityReservationGroupID(vm)
 
 	if tag, ok := vm.Tags[launchtemplate.NodePoolTagKey]; ok {
 		labels[karpv1.NodePoolLabelKey] = *tag
@@ -747,6 +812,22 @@ func truncateMessage(msg string) string {
 	return msg[:truncateAt] + "..."
 }
 
+// toCreateError wraps an instance-create failure as a *cloudprovider.CreateError with the
+// wrapMsg context prefix. When err carries a classified CreateError (set by the offerings
+// error handlers, e.g. SKUNotAvailable or ZonalAllocationFailure), its specific Launched
+// condition reason and message are surfaced so consumers can branch on the cause; otherwise
+// it falls back to the generic CreateInstanceFailed reason and error text, preserving prior
+// behavior.
+func toCreateError(err error, wrapMsg string) error {
+	reason := CreateInstanceFailedReason
+	message := err.Error()
+	if classified, ok := stderrors.AsType[*cloudprovider.CreateError](err); ok {
+		reason = classified.ConditionReason
+		message = classified.ConditionMessage
+	}
+	return cloudprovider.NewCreateError(fmt.Errorf("%s, %w", wrapMsg, err), reason, truncateMessage(message))
+}
+
 func setAdditionalAnnotationsForNewNodeClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) error {
 	// Additional annotations
 	// ASSUMPTION: this is not needed in other places that the core also wants NodeClaim (e.g., Get, List).
@@ -757,9 +838,10 @@ func setAdditionalAnnotationsForNewNodeClaim(ctx context.Context, nodeClaim *kar
 		return fmt.Errorf("failed to calculate in place update hash, %w", err)
 	}
 	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-		v1beta1.AnnotationAKSNodeClassHash:        nodeClass.Hash(),
-		v1beta1.AnnotationAKSNodeClassHashVersion: v1beta1.AKSNodeClassHashVersion,
-		v1beta1.AnnotationInPlaceUpdateHash:       inPlaceUpdateHash,
+		v1beta1.AnnotationAKSNodeClassHash:           nodeClass.Hash(),
+		v1beta1.AnnotationAKSNodeClassHashVersion:    v1beta1.AKSNodeClassHashVersion,
+		v1beta1.AnnotationInPlaceUpdateHash:          inPlaceUpdateHash,
+		v1beta1.AnnotationCapacityReservationGroupID: nodeClass.GetCapacityReservationGroupID(),
 	})
 	return nil
 }

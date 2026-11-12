@@ -45,11 +45,13 @@ const (
 	ProvisionModeBootstrappingClient      = "bootstrappingclient"
 	ProvisionModeAKSMachineAPI            = "aksmachineapi"
 	ProvisionModeAKSMachineAPIHeaderBatch = "aksmachineapiheaderbatch"
-	// ProvisionModeOpenShift is for OpenShift/HyperShift clusters where userData (Ignition config)
-	// is provided externally via the NodeClass spec, bypassing all AKS-specific bootstrapping.
-	ProvisionModeOpenShift = "openshift"
 
 	AKSMachineAPIHeaderBatchMaxSize = 50
+
+	// Compute recommendation mode values.
+	ComputeRecommendationModeDisabled = "disabled"
+	ComputeRecommendationModeLog      = "log-only"
+	ComputeRecommendationModeEnabled  = "enabled"
 
 	// Provisioning states for AKS Machine objects.
 	// The SDK's Machine.Properties.ProvisioningState is typed as *string (no typed constants).

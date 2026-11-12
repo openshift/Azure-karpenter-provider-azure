@@ -24,7 +24,11 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
 	"github.com/samber/lo"
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
@@ -43,13 +47,14 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/zone"
-	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/test/azure"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/common"
+	clock "k8s.io/utils/clock"
 )
 
 func init() {
-	karpv1.NormalizedLabels = lo.Assign(karpv1.NormalizedLabels, map[string]string{"topology.disk.csi.azure.com/zone": v1.LabelTopologyZone})
+	zones.RegisterCSIZoneNormalization()
 	coretest.DefaultImage = "mcr.microsoft.com/oss/kubernetes/pause:3.6"
 }
 
@@ -89,8 +94,10 @@ type Environment struct {
 	zoneProvider         *zone.Provider
 
 	// Public Clients
-	KeyVaultClient          *armkeyvault.VaultsClient
-	DiskEncryptionSetClient *armcompute.DiskEncryptionSetsClient
+	KeyVaultClient                  *armkeyvault.VaultsClient
+	DiskEncryptionSetClient         *armcompute.DiskEncryptionSetsClient
+	CapacityReservationGroupsClient *armcompute.CapacityReservationGroupsClient
+	CapacityReservationsClient      *armcompute.CapacityReservationsClient
 
 	defaultCredential azcore.TokenCredential
 
@@ -162,7 +169,7 @@ func NewEnvironment(t *testing.T) *Environment {
 			Cloud: azureEnv.CloudConfig,
 		},
 	}
-	byokRetryOptions := azureEnv.ClientOptionsForRBACPropagation()
+	rbacPropagationRetryOptions := azureEnv.ClientOptionsForRBACPropagation()
 	azureEnv.vmClient = lo.Must(armcompute.NewVirtualMachinesClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.vnetClient = lo.Must(armnetwork.NewVirtualNetworksClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.subnetClient = lo.Must(armnetwork.NewSubnetsClient(azureEnv.SubscriptionID, cred, clientOptions))
@@ -170,11 +177,15 @@ func NewEnvironment(t *testing.T) *Environment {
 	azureEnv.managedClusterClient = lo.Must(containerservice.NewManagedClustersClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.agentPoolClient = lo.Must(containerservice.NewAgentPoolsClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.machinesClient = lo.Must(containerservice.NewMachinesClient(azureEnv.SubscriptionID, cred, clientOptions))
-	azureEnv.KeyVaultClient = lo.Must(armkeyvault.NewVaultsClient(azureEnv.SubscriptionID, cred, byokRetryOptions))
-	azureEnv.DiskEncryptionSetClient = lo.Must(armcompute.NewDiskEncryptionSetsClient(azureEnv.SubscriptionID, cred, byokRetryOptions))
+	azureEnv.KeyVaultClient = lo.Must(armkeyvault.NewVaultsClient(azureEnv.SubscriptionID, cred, rbacPropagationRetryOptions))
+	azureEnv.DiskEncryptionSetClient = lo.Must(armcompute.NewDiskEncryptionSetsClient(azureEnv.SubscriptionID, cred, rbacPropagationRetryOptions))
+	// Reuses the RBAC-propagation retry options: tests grant a role on the group and then
+	// immediately expect Karpenter to read it.
+	azureEnv.CapacityReservationGroupsClient = lo.Must(armcompute.NewCapacityReservationGroupsClient(azureEnv.SubscriptionID, cred, rbacPropagationRetryOptions))
+	azureEnv.CapacityReservationsClient = lo.Must(armcompute.NewCapacityReservationsClient(azureEnv.SubscriptionID, cred, rbacPropagationRetryOptions))
 	azureEnv.RBACManager = lo.Must(NewRBACManager(azureEnv.SubscriptionID, cred))
 	subscriptionsClient := lo.Must(armsubscriptions.NewClient(cred, nil))
-	azureEnv.zoneProvider = zone.NewProvider(subscriptionsClient, realClock{}, azureEnv.SubscriptionID)
+	azureEnv.zoneProvider = zone.NewProvider(subscriptionsClient, clock.RealClock{}, azureEnv.SubscriptionID)
 	// If ProvisionMode wasn't set, default to scriptless, though note that this is
 	// actually defaulted dynamically based on the value of a toggle in AKS which means
 	// assuming we're always in ProvisionMode Scriptless here is incorrect at times, though OK
@@ -185,7 +196,9 @@ func NewEnvironment(t *testing.T) *Environment {
 	// Default to reserved managed machine agentpool name for NAP
 	azureEnv.MachineAgentPoolName = "aksmanagedap"
 	if azureEnv.InClusterController {
-		azureEnv.MachineAgentPoolName = "testmpool"
+		// Self-hosted machines pool name; matches AKS_MACHINES_POOL_NAME used at deploy time.
+		// Note: Windows machines require an agent pool name <= 6 characters, so keep this short.
+		azureEnv.MachineAgentPoolName = lo.Ternary(os.Getenv("AKS_MACHINES_POOL_NAME") == "", "mpool", os.Getenv("AKS_MACHINES_POOL_NAME"))
 	}
 	// Confirm we have a machine pool
 	if azureEnv.InClusterController && azureEnv.IsAKSMachineAPIMode() {
@@ -193,10 +206,6 @@ func NewEnvironment(t *testing.T) *Environment {
 	}
 	return azureEnv
 }
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
 
 func (env *Environment) GetDefaultCredential() azcore.TokenCredential {
 	return env.defaultCredential
@@ -245,15 +254,73 @@ func (env *Environment) UsesSharedImageGallery() bool {
 	return env.IsMachineModeOrNPS()
 }
 
-func (env *Environment) DefaultAKSNodeClass() *v1beta1.AKSNodeClass {
-	nodeClass := test.AKSNodeClass()
-	return nodeClass
+// WindowsNodePool returns a NodePool that provisions Windows (amd64) nodes for the given
+// nodeClass by replacing the default os=linux requirement with os=windows.
+func (env *Environment) WindowsNodePool(nodeClass *v1beta1.AKSNodeClass) *karpv1.NodePool {
+	nodePool := env.DefaultNodePool(nodeClass)
+	coretest.ReplaceRequirements(nodePool,
+		karpv1.NodeSelectorRequirementWithMinValues{
+			Key:      v1.LabelOSStable,
+			Operator: v1.NodeSelectorOpIn,
+			Values:   []string{string(v1.Windows)},
+		},
+	)
+	return nodePool
 }
 
-func (env *Environment) AZLinuxNodeClass() *v1beta1.AKSNodeClass {
-	nodeClass := env.DefaultAKSNodeClass()
-	nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
-	return nodeClass
+// SkipIfNotWindowsCapable skips the running spec unless this environment can actually provision
+// Windows nodes. Windows is an OS dimension layered onto existing suites, so suites that add
+// Windows cases call this rather than duplicating the preconditions.
+func (env *Environment) SkipIfNotWindowsCapable() {
+	GinkgoHelper()
+	// Windows nodes are only provisionable via the AKS Machine API provision mode.
+	if !env.IsAKSMachineAPIMode() {
+		Skip("Windows node provisioning is only supported in AKS Machine API provision mode")
+	}
+	// Windows machine names are bounded by the Windows NetBIOS computer-name limit once the AKS RP
+	// composes the VM name from the pool and machine names. The reserved NAP pool ("aksmanagedap")
+	// uses a 12-character pool-hash plus NodeClaim-suffix name. Custom pools use only the
+	// five-character NodeClaim suffix and additionally require the pool name to be <= 6 chars.
+	if env.MachineAgentPoolName != "aksmanagedap" && len(env.MachineAgentPoolName) > 6 {
+		Skip(fmt.Sprintf("Windows machines require the reserved aksmanagedap pool or a custom machines pool name <= 6 chars; got %q (%d chars)",
+			env.MachineAgentPoolName, len(env.MachineAgentPoolName)))
+	}
+	managedCluster := env.ExpectGetManagedCluster()
+	// Windows nodes do not support the Cilium dataplane configured on the cluster.
+	if managedCluster.Properties != nil && managedCluster.Properties.NetworkProfile != nil &&
+		lo.FromPtr(managedCluster.Properties.NetworkProfile.NetworkDataplane) == containerservice.NetworkDataplaneCilium {
+		Skip("Windows node provisioning is not supported with the Cilium dataplane")
+	}
+	// The AKS RP sources Windows node admin credentials from the cluster's windowsProfile, so a
+	// cluster without one cannot provision Windows at all. Fail rather than skip: the E2E workflow
+	// is expected to have created a Windows-capable cluster for any suite that reaches this point,
+	// so a missing windowsProfile is a misconfiguration that should be surfaced, not hidden.
+	Expect(managedCluster.Properties).ToNot(BeNil())
+	Expect(managedCluster.Properties.WindowsProfile).ToNot(BeNil(),
+		"cluster has no windowsProfile; the E2E workflow must create a Windows-capable cluster for suites running Windows contexts")
+}
+
+// WindowsPauseImage is a minimal Windows container image suitable for E2E workloads.
+const WindowsPauseImage = "mcr.microsoft.com/oss/kubernetes/pause:3.9"
+
+// WindowsDeployment returns a Deployment that only schedules onto Windows nodes. It defaults the
+// container image to a Windows image and tolerates the OS taint Karpenter may briefly surface
+// while a Windows node registers.
+func (env *Environment) WindowsDeployment(options coretest.DeploymentOptions) *appsv1.Deployment {
+	if options.PodOptions.Image == "" {
+		options.PodOptions.Image = WindowsPauseImage
+	}
+	if options.PodOptions.NodeSelector == nil {
+		options.PodOptions.NodeSelector = map[string]string{}
+	}
+	options.PodOptions.NodeSelector[v1.LabelOSStable] = string(v1.Windows)
+	options.PodOptions.Tolerations = append(options.PodOptions.Tolerations, v1.Toleration{
+		Key:      v1.LabelOSStable,
+		Operator: v1.TolerationOpEqual,
+		Value:    string(v1.Windows),
+		Effect:   v1.TaintEffectNoSchedule,
+	})
+	return coretest.Deployment(options)
 }
 
 // Pod wraps coretest.Pod for Azure E2E tests; use it instead of coretest.Pod when the test should apply Azure environment defaults.

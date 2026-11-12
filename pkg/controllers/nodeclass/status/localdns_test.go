@@ -40,8 +40,8 @@ import (
 )
 
 const (
-	hiK8s = "1.36.0"
-	loK8s = "1.35.0"
+	hiK8s = "1.37.0"
+	loK8s = "1.36.0"
 )
 
 func newDynFake() *dynamicfake.FakeDynamicClient {
@@ -115,6 +115,15 @@ func TestPreferred_K8sBelowThreshold_Disabled(t *testing.T) {
 	expectState(t, nc, v1beta1.LocalDNSStateDisabled)
 }
 
+func TestPreferred_K8sAtThreshold_Enabled(t *testing.T) {
+	nc := newNC()
+	nc.Spec.LocalDNS = &v1beta1.LocalDNS{Mode: v1beta1.LocalDNSModePreferred}
+	setKVReady(nc, hiK8s)
+	r := NewLocalDNSReconciler(fake.NewClientset(), newDynFake(), "", "azure")
+	mustReconcile(t, r, nc)
+	expectState(t, nc, v1beta1.LocalDNSStateEnabled)
+}
+
 func TestPreferred_BYOCNI_Disabled(t *testing.T) {
 	nc := newNC()
 	nc.Spec.LocalDNS = &v1beta1.LocalDNS{Mode: v1beta1.LocalDNSModePreferred}
@@ -124,7 +133,7 @@ func TestPreferred_BYOCNI_Disabled(t *testing.T) {
 	expectState(t, nc, v1beta1.LocalDNSStateDisabled)
 }
 
-func TestPreferred_Ubuntu2004_Disabled(t *testing.T) {
+func TestPreferred_UbuntuFIPS_Enabled(t *testing.T) {
 	nc := newNC()
 	nc.Spec.LocalDNS = &v1beta1.LocalDNS{Mode: v1beta1.LocalDNSModePreferred}
 	nc.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
@@ -132,7 +141,7 @@ func TestPreferred_Ubuntu2004_Disabled(t *testing.T) {
 	setKVReady(nc, hiK8s)
 	r := NewLocalDNSReconciler(fake.NewClientset(), newDynFake(), "", "azure")
 	mustReconcile(t, r, nc)
-	expectState(t, nc, v1beta1.LocalDNSStateDisabled)
+	expectState(t, nc, v1beta1.LocalDNSStateEnabled)
 }
 
 func TestPreferred_NoConflicts_Enabled(t *testing.T) {

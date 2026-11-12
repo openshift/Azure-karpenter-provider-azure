@@ -24,6 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -31,7 +33,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -44,7 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpapis "sigs.k8s.io/karpenter/pkg/apis"
-	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
 
 	"sigs.k8s.io/karpenter/pkg/operator"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
@@ -60,6 +61,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/capacityrecommendation"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/machinecache"
@@ -69,12 +71,14 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/quota"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	armopts "github.com/Azure/karpenter-provider-azure/pkg/utils/clientopts"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
 
 func init() {
-	karpv1.NormalizedLabels = lo.Assign(karpv1.NormalizedLabels, map[string]string{"topology.disk.csi.azure.com/zone": corev1.LabelTopologyZone})
+	zones.RegisterCSIZoneNormalization()
 }
 
 type Operator struct {
@@ -101,7 +105,14 @@ type Operator struct {
 	VMInstanceProvider        *instance.DefaultVMProvider
 	AKSMachineProvider        *instance.DefaultAKSMachineProvider
 	LoadBalancerProvider      *loadbalancer.Provider
+	QuotaProvider             *quota.DefaultProvider
 	AZClient                  *azclient.AZClient
+
+	// SubscriptionID and Location identify the Azure scope this operator manages.
+	SubscriptionID string
+	Location       string
+	// Cloud is the resolved Azure cloud, which not every feature is available in.
+	Cloud cloud.Configuration
 }
 
 func kubeDNSIP(ctx context.Context, kubernetesInterface kubernetes.Interface) (net.IP, error) {
@@ -179,9 +190,11 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	)
 
 	kubernetesVersionProvider := kubernetesversion.NewKubernetesVersionProvider(
+		azConfig.Location,
 		operator.KubernetesInterface,
 		cache.New(azurecache.KubernetesVersionTTL,
 			azurecache.DefaultCleanupInterval),
+		azClient.ManagedClustersClient(),
 	)
 	imageProvider := imagefamily.NewProvider(
 		azClient.ImageVersionsClient,
@@ -191,12 +204,14 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		cache.New(imagefamily.ImageExpirationInterval,
 			imagefamily.ImageCacheCleaningInterval),
 	)
+	quotaProvider := quota.NewProvider(azClient.UsageClient, azClient.QuotaCategoryVMFamilyMappingClient, azConfig.Location, operator.Clock)
 	instanceTypeProvider := instancetype.NewDefaultProvider(
 		azConfig.Location,
 		cache.New(instancetype.InstanceTypesCacheTTL, azurecache.DefaultCleanupInterval),
 		azClient.SKUClient,
 		pricingProvider,
 		unavailableOfferingsCache,
+		quotaProvider,
 	)
 
 	// Ensure we're able to hydrate instance types before starting any controllers
@@ -234,7 +249,15 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		cache.New(loadbalancer.LoadBalancersCacheTTL, azurecache.DefaultCleanupInterval),
 		options.FromContext(ctx).NodeResourceGroup,
 	)
-	allocationStrategyProvider := allocationstrategy.NewProvider()
+	capacityRecommendationProvider := capacityrecommendation.NewProvider(
+		azClient.SKUMixPlacementClient,
+		cache.New(cache.NoExpiration, azurecache.DefaultCleanupInterval),
+		azConfig.Location,
+	)
+	allocationStrategyProvider := allocationstrategy.NewProvider(
+		capacityRecommendationProvider,
+		options.FromContext(ctx).ComputeRecommendationMode,
+	)
 	vmInstanceProvider := instance.NewDefaultVMProvider(
 		azClient,
 		instanceTypeProvider,
@@ -249,6 +272,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		options.FromContext(ctx).ProvisionMode,
 		options.FromContext(ctx).DiskEncryptionSetID,
 		env,
+		quotaProvider,
 	)
 
 	aksMachineCache := machinecache.New(
@@ -272,6 +296,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		azConfig.Location,
 		options.FromContext(ctx).ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch,
 		aksMachineCache,
+		quotaProvider,
 	)
 
 	return ctx, &Operator{
@@ -288,7 +313,11 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		VMInstanceProvider:           vmInstanceProvider,
 		AKSMachineProvider:           aksMachineInstanceProvider,
 		LoadBalancerProvider:         loadBalancerProvider,
+		QuotaProvider:                quotaProvider,
 		AZClient:                     azClient,
+		SubscriptionID:               azConfig.SubscriptionID,
+		Location:                     azConfig.Location,
+		Cloud:                        env.Cloud,
 	}
 }
 
@@ -349,7 +378,7 @@ func getVnetGUID(ctx context.Context, creds azcore.TokenCredential, cfg *auth.Co
 
 // WaitForCRDs waits for the required CRDs to be available with a timeout
 func WaitForCRDs(ctx context.Context, timeout time.Duration, config *rest.Config, log logr.Logger) error {
-	requiredGVKs := getRequiredGVKs()
+	requiredGVKs := getRequiredGVKs(ctx)
 	client, err := rest.HTTPClientFor(config)
 	if err != nil {
 		return fmt.Errorf("creating kubernetes client, %w", err)
@@ -418,9 +447,13 @@ func getCredential(env *auth.Environment) (azcore.TokenCredential, error) {
 	return auth.NewTokenWrapper(cred), nil
 }
 
-func getRequiredGVKs() []schema.GroupVersionKind {
+func getRequiredGVKs(ctx context.Context) []schema.GroupVersionKind {
 	// controller-runtime internal, ignore them as we don't watch them
 	internalTypes := []string{"WatchEvent", "UpdateOptions", "DeleteOptions", "ListOptions", "CreateOptions", "PatchOptions", "GetOptions"}
+	requiredGroups := []string{karpapis.Group, v1beta1.Group}
+	if coreoptions.FromContext(ctx).FeatureGates.CapacityBuffer {
+		requiredGroups = append(requiredGroups, autoscalingv1beta1.Group)
+	}
 	requiredGVKs := lo.Filter(lo.Keys(scheme.Scheme.AllKnownTypes()), func(gvk schema.GroupVersionKind, _ int) bool {
 		if lo.Contains(internalTypes, gvk.Kind) {
 			return false
@@ -431,7 +464,7 @@ func getRequiredGVKs() []schema.GroupVersionKind {
 			return false
 		}
 
-		return gvk.Group == karpapis.Group || gvk.Group == v1beta1.Group
+		return lo.Contains(requiredGroups, gvk.Group)
 	})
 	return requiredGVKs
 }
