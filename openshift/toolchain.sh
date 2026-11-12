@@ -22,6 +22,7 @@ tools() {
     # so install them separately with their own isolated dep graphs.
     go install -mod=mod github.com/google/ko@v0.17.1
     go install -mod=mod github.com/Azure/aks-node-viewer/cmd/aks-node-viewer@v0.0.2-alpha
+    go install -mod=mod helm.sh/helm/v3/cmd/helm@v3.15.2
 }
 
 golangci_lint_custom() {

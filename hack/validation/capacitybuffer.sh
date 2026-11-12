@@ -164,7 +164,11 @@ for render in "$standalone_crd_render" "$main_crd_render"; do
     }
 done
 
-core_crd="$(go list -m -f '{{.Dir}}' sigs.k8s.io/karpenter)/pkg/apis/crds/autoscaling.x-k8s.io_capacitybuffers.yaml"
+core_module_dir="$(go list -m -f '{{.Dir}}' sigs.k8s.io/karpenter)"
+if [[ -z "$core_module_dir" ]]; then
+    core_module_dir="vendor/sigs.k8s.io/karpenter"
+fi
+core_crd="${core_module_dir}/pkg/apis/crds/autoscaling.x-k8s.io_capacitybuffers.yaml"
 # The module dependency is authoritative. Generated/copied/chart paths must
 # retain its API version and exact schema.
 for crd in \
