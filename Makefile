@@ -174,9 +174,8 @@ openshift-toolchain:
 openshift-verify: ## Verify code. Includes dependencies, linting, formatting, etc
 	go generate ./...
 	hack/boilerplate.sh
-	# Copy pinned core CRDs and make the local copies writable
+	# Copy pinned core CRDs from the vendored Karpenter dependency
 	cp -f $(addprefix vendor/sigs.k8s.io/karpenter/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
-	chmod u+w $(addprefix pkg/apis/crds/,$(KARPENTER_CORE_CRDS))
 	# Apply provider-specific CRD changes before packaging them
 	hack/validation/kubelet.sh
 	hack/validation/labels.sh
@@ -185,7 +184,6 @@ openshift-verify: ## Verify code. Includes dependencies, linting, formatting, et
 	hack/mutation/kubectl_get_ux.sh
 	# Package the adjusted CRDs, then validate CapacityBuffer chart delivery
 	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
-	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
 	GOFLAGS=-mod=mod hack/validation/capacitybuffer.sh
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
@@ -200,14 +198,12 @@ openshift-generate: ## Generate and copy CRDs
 	go generate ./...
 	hack/boilerplate.sh
 	cp -f $(addprefix vendor/sigs.k8s.io/karpenter/pkg/apis/crds/,$(KARPENTER_CORE_CRDS)) pkg/apis/crds
-	chmod u+w $(addprefix pkg/apis/crds/,$(KARPENTER_CORE_CRDS))
 	hack/validation/kubelet.sh
 	hack/validation/labels.sh
 	hack/validation/requirements.sh
 	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
 	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
-	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
 	GOFLAGS=-mod=mod hack/validation/capacitybuffer.sh
 
 openshift-test: ## Run tests
