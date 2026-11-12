@@ -2082,7 +2082,7 @@ var _ = Describe("CEL/Validation", func() {
 			}
 			err := env.Client.Create(ctx, nodeClass)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("publisher, offer, sku and version must all be set"))
+			Expect(err.Error()).To(ContainSubstring("spec.marketplaceImage.publisher: Required value"))
 		})
 	})
 

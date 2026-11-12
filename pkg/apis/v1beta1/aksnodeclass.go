@@ -319,20 +319,23 @@ type Security struct {
 }
 
 // MarketplaceImage selects an Azure Marketplace platform image.
-// +kubebuilder:validation:XValidation:message="publisher, offer, sku and version must all be set",rule="self.publisher != ” && self.offer != ” && self.sku != ” && self.version != ”"
 type MarketplaceImage struct {
 	// publisher is the name of the organization that published the image.
 	// +required
-	Publisher string `json:"publisher"`
+	// +kubebuilder:validation:MinLength=1
+	Publisher string `json:"publisher,omitempty"`
 	// offer is the product line of the image.
 	// +required
-	Offer string `json:"offer"`
+	// +kubebuilder:validation:MinLength=1
+	Offer string `json:"offer,omitempty"`
 	// sku is the specific image flavor.
 	// +required
-	SKU string `json:"sku"`
+	// +kubebuilder:validation:MinLength=1
+	SKU string `json:"sku,omitempty"`
 	// version is the image build version.
 	// +required
-	Version string `json:"version"`
+	// +kubebuilder:validation:MinLength=1
+	Version string `json:"version,omitempty"`
 }
 
 // +kubebuilder:validation:Enum:={Preferred,Required,Disabled}
@@ -1140,7 +1143,10 @@ func (in *AKSNodeClass) HasMarketplaceImage() bool {
 		return false
 	}
 	m := in.Spec.MarketplaceImage
-	return m.Publisher != "" && m.Offer != "" && m.SKU != "" && m.Version != ""
+	return m.Publisher != "" &&
+		m.Offer != "" &&
+		m.SKU != "" &&
+		m.Version != ""
 }
 
 // MarketplaceImageURN returns the standard Publisher:Offer:Sku:Version representation.

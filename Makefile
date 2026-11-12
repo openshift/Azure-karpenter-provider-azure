@@ -168,7 +168,45 @@ tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
 download: ## Recursively "go mod download" on all directories where go.mod exists
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
 
-.PHONY: help build presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download
+openshift-toolchain:
+	./openshift/toolchain.sh
+
+openshift-verify: ## Verify code. Includes dependencies, linting, formatting, etc
+	go generate ./...
+	hack/boilerplate.sh
+	cp $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
+	hack/validation/labels.sh
+	hack/validation/requirements.sh
+	hack/mutation/kubectl_get_ux.sh
+	cp pkg/apis/crds/* charts/karpenter-crd/templates
+	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
+	@git diff --quiet ||\
+		{ echo "New file modification detected in the Git working tree. Please check in before commit."; git --no-pager diff --name-only | uniq | awk '{print "  - " $$0}'; \
+		if [ "${CI}" = true ]; then\
+			exit 1;\
+		fi;}
+	actionlint -oneline
+
+openshift-generate: ## Generate and copy CRDs
+	go generate ./...
+	hack/boilerplate.sh
+	cp vendor/sigs.k8s.io/karpenter/pkg/apis/crds/* pkg/apis/crds
+	hack/validation/labels.sh
+	hack/validation/requirements.sh
+	hack/mutation/kubectl_get_ux.sh
+	cp pkg/apis/crds/* charts/karpenter-crd/templates
+
+openshift-test: ## Run tests
+	go run ./vendor/github.com/onsi/ginkgo/v2/ginkgo -vv \
+		-cover -coverprofile=coverage.out -output-dir=. -coverpkg=./pkg/... \
+		--focus="${FOCUS}" \
+		--randomize-all \
+		./pkg/...
+
+openshift-lint-fix: ## Golangci-lint-custom fix
+	golangci-lint-custom run
+
+.PHONY: help build presubmit ci-test ci-non-test test deflake deflake-until-it-fails e2etests upstream-e2etests coverage verify vulncheck licenses codegen codegen-pricing codegen-locations codegen-skugen codegen-allazureskus snapshot release toolchain tidy download openshift-toolchain openshift-verify openshift-generate openshift-test openshift-lint-fix
 
 define newline
 
