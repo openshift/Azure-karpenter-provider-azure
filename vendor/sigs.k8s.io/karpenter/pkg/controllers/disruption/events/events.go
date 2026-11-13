@@ -28,6 +28,36 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
+// NodeRepairBlocked warns that node repair is being withheld because too much of the NodePool is unhealthy.
+func NodeRepairBlocked(node *corev1.Node, nodeClaim *v1.NodeClaim, nodePool *v1.NodePool, msg string) []events.Event {
+	return []events.Event{
+		{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeWarning,
+			Reason:         events.NodeRepairBlocked,
+			Message:        msg,
+			DedupeValues:   []string{string(node.UID)},
+			DedupeTimeout:  15 * time.Minute,
+		},
+		{
+			InvolvedObject: nodeClaim,
+			Type:           corev1.EventTypeWarning,
+			Reason:         events.NodeRepairBlocked,
+			Message:        msg,
+			DedupeValues:   []string{string(nodeClaim.UID)},
+			DedupeTimeout:  15 * time.Minute,
+		},
+		{
+			InvolvedObject: nodePool,
+			Type:           corev1.EventTypeWarning,
+			Reason:         events.NodeRepairBlocked,
+			Message:        msg,
+			DedupeValues:   []string{string(nodePool.UID)},
+			DedupeTimeout:  15 * time.Minute,
+		},
+	}
+}
+
 func Launching(nodeClaim *v1.NodeClaim, reason string) events.Event {
 	return events.Event{
 		InvolvedObject: nodeClaim,
@@ -178,5 +208,41 @@ func ConsolidationRejected(node *corev1.Node, nodeClaim *v1.NodeClaim, command s
 			Message:        message,
 			DedupeValues:   []string{string(nodeClaim.UID), command, reason},
 		},
+	}
+}
+
+func consolidationScoreMessage(score, threshold float64, k int32, savingsPct, disruptionPct float64) string {
+	return fmt.Sprintf("score %.2f >= threshold %.2f (k: %d, savings %.1f%%, disruption %.1f%%)",
+		score, threshold, k, savingsPct, disruptionPct)
+}
+
+func ConsolidationApproved(node *corev1.Node, nodeClaim *v1.NodeClaim, score, threshold float64, k int32, savingsPct, disruptionPct float64) []events.Event {
+	msg := consolidationScoreMessage(score, threshold, k, savingsPct, disruptionPct)
+	return []events.Event{
+		{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeNormal,
+			Reason:         events.ConsolidationApproved,
+			Message:        msg,
+			DedupeValues:   []string{string(node.UID)},
+		},
+		{
+			InvolvedObject: nodeClaim,
+			Type:           corev1.EventTypeNormal,
+			Reason:         events.ConsolidationApproved,
+			Message:        msg,
+			DedupeValues:   []string{string(nodeClaim.UID)},
+		},
+	}
+}
+
+func ConsolidationApprovedMultiNode(nodePool *v1.NodePool, score, threshold float64, k int32, savingsPct, disruptionPct float64) events.Event {
+	msg := consolidationScoreMessage(score, threshold, k, savingsPct, disruptionPct)
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeNormal,
+		Reason:         events.ConsolidationApproved,
+		Message:        msg,
+		DedupeValues:   []string{string(nodePool.UID)},
 	}
 }

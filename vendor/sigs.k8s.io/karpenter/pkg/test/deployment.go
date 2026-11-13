@@ -20,8 +20,6 @@ import (
 	"fmt"
 	"maps"
 
-	"github.com/samber/lo"
-
 	"github.com/imdario/mergo"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -60,7 +58,7 @@ func Deployment(overrides ...DeploymentOptions) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: objectMeta,
 		Spec: appsv1.DeploymentSpec{
-			Replicas: lo.ToPtr(options.Replicas),
+			Replicas: new(options.Replicas),
 			Selector: &metav1.LabelSelector{MatchLabels: options.PodOptions.Labels},
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: pod.ObjectMeta,

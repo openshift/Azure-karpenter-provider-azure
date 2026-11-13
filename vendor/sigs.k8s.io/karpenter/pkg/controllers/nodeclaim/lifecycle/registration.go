@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/awslabs/operatorpkg/object"
+	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
@@ -121,6 +122,7 @@ func (r *Registration) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (
 
 	metrics.NodesCreatedTotal.Inc(map[string]string{
 		metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
+		metrics.ZoneLabel:     nodeClaim.Labels[corev1.LabelTopologyZone],
 	})
 	if err := r.updateNodePoolRegistrationHealth(ctx, nodeClaim); client.IgnoreNotFound(err) != nil {
 		if errors.IsConflict(err) {
@@ -180,7 +182,7 @@ func (r *Registration) updateNodePoolRegistrationHealth(ctx context.Context, nod
 	if nodePoolName != "" {
 		nodePool := &v1.NodePool{}
 		if err := r.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
-			return err
+			return serrors.Wrap(fmt.Errorf("getting nodepool, %w", err), "NodePool", klog.KRef("", nodePoolName))
 		}
 		if _, found := lo.Find(nodeClaim.GetOwnerReferences(), func(o metav1.OwnerReference) bool {
 			return o.Kind == object.GVK(nodePool).Kind && o.UID == nodePool.UID
@@ -193,7 +195,7 @@ func (r *Registration) updateNodePoolRegistrationHealth(ctx context.Context, nod
 			// can cause races due to the fact that it fully replaces the list on a change
 			// Here, we are updating the status condition list
 			if err := r.kubeClient.Status().Patch(ctx, nodePool, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
-				return err
+				return serrors.Wrap(fmt.Errorf("patching nodepool status, %w", err), "NodePool", klog.KObj(nodePool))
 			}
 		}
 		r.npState.Update(nodePool.UID, true)

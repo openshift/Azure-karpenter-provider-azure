@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	opstatus "github.com/awslabs/operatorpkg/status"
@@ -33,13 +34,26 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func TestValidateNodeClassRejectsNonFIPSBeforeStatusReconciliation(t *testing.T) {
+	g := NewWithT(t)
+	ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{EnableFIPS: lo.ToPtr(true)}))
+	nodeClass := &v1beta1.AKSNodeClass{
+		Spec: v1beta1.AKSNodeClassSpec{},
+	}
+	nodeClass.StatusConditions().SetTrue("Ready")
+
+	err := (&CloudProvider{}).validateNodeClass(ctx, nodeClass)
+
+	g.Expect(err).To(MatchError(ContainSubstring("spec.fipsMode must be set to FIPS")))
+}
+
 func TestValidateNodeClassOpenShift(t *testing.T) {
 	openShiftCtx := test.Options(test.OptionsFields{
 		ProvisionMode: lo.ToPtr(consts.ProvisionModeOpenShift),
 	}).ToContext(context.Background())
 
 	validNodeClass := func() *v1beta1.AKSNodeClass {
-		nc := test.AKSNodeClass(v1beta1.AKSNodeClass{
+		nc := &v1beta1.AKSNodeClass{
 			Spec: v1beta1.AKSNodeClassSpec{
 				MarketplaceImage: &v1beta1.MarketplaceImage{
 					Publisher: "azureopenshift",
@@ -49,7 +63,7 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 				},
 				UserData: lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
 			},
-		})
+		}
 		nc.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)
 		return nc
 	}
@@ -102,18 +116,18 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 		{
 			name: "OpenShift mode requires marketplaceImage",
 			ctx:  openShiftCtx,
-			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
+			nodeClass: &v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
 					UserData: lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
 				},
-			}),
+			},
 			expectErr: true,
 			errMsg:    "marketplaceImage is required in OpenShift mode",
 		},
 		{
 			name: "OpenShift mode requires userData",
 			ctx:  openShiftCtx,
-			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
+			nodeClass: &v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
 					MarketplaceImage: &v1beta1.MarketplaceImage{
 						Publisher: "azureopenshift",
@@ -122,14 +136,14 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 						Version:   "9.8.20260428",
 					},
 				},
-			}),
+			},
 			expectErr: true,
 			errMsg:    "userData is required in OpenShift mode",
 		},
 		{
 			name: "OpenShift mode rejects empty userData",
 			ctx:  openShiftCtx,
-			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
+			nodeClass: &v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
 					MarketplaceImage: &v1beta1.MarketplaceImage{
 						Publisher: "azureopenshift",
@@ -139,7 +153,7 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 					},
 					UserData: lo.ToPtr(""),
 				},
-			}),
+			},
 			expectErr: true,
 			errMsg:    "userData is required in OpenShift mode",
 		},

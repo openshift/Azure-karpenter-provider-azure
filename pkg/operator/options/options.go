@@ -38,7 +38,31 @@ import (
 )
 
 func init() {
+	overrideCoreOptions(coreoptions.Injectables)
 	coreoptions.Injectables = append(coreoptions.Injectables, &Options{})
+}
+
+func overrideCoreOptions(injectables []coreoptions.Injectable) {
+	found := false
+	for i, injectable := range injectables {
+		if opts, ok := injectable.(*coreoptions.Options); ok {
+			injectables[i] = &CoreOptions{Options: *opts}
+			found = true
+		}
+	}
+	if !found {
+		panic("cannot apply Azure legacy repair defaults: *coreoptions.Options not found in coreoptions.Injectables")
+	}
+}
+
+// CoreOptions preserves Azure's legacy repair default while allowing explicit core flag overrides.
+type CoreOptions struct {
+	coreoptions.Options
+}
+
+func (o *CoreOptions) AddFlags(fs *coreoptions.FlagSet) {
+	o.Options.AddFlags(fs)
+	o.LegacyNodeRepair = env.WithDefaultBool("LEGACY_NODE_REPAIR", true)
 }
 
 type nodeIdentitiesValue []string
@@ -63,12 +87,19 @@ func (s *nodeIdentitiesValue) String() string { return strings.Join(*s, ",") }
 type optionsKey struct{}
 
 type Options struct {
-	ClusterName                    string  `json:"clusterName,omitempty"`
-	ClusterEndpoint                string  `json:"clusterEndpoint,omitempty"` // => APIServerName in bootstrap, except needs to be w/o https/port
-	VMMemoryOverheadPercent        float64 `json:"vmMemoryOverheadPercent,omitempty"`
-	KubeletClientTLSBootstrapToken string  `json:"-"` // => TLSBootstrapToken in bootstrap (may need to be per node/nodepool)
-	LinuxAdminUsername             string  `json:"-"`
-	SSHPublicKey                   string  `json:"-"` // ssh.publicKeys.keyData => VM SSH public key // TODO: move to v1beta1.AKSNodeClass?
+	ClusterName             string  `json:"clusterName,omitempty"`
+	ClusterEndpoint         string  `json:"clusterEndpoint,omitempty"` // => APIServerName in bootstrap, except needs to be w/o https/port
+	VMMemoryOverheadPercent float64 `json:"vmMemoryOverheadPercent,omitempty"`
+	// EnableNodeHardening records the temporary ManagedCluster preview flag, but does not by itself
+	// mean node hardening is active. The bootstrappingclient mode intentionally ignores this flag
+	// because its bootstrap backend does not apply the matching kubelet configuration. Consumers
+	// must use ShouldUseNodeHardening instead of reading this field directly.
+	// Will remove this option when AKS defaults node hardening for new nodes based on Kubernetes version
+	// (expected 1.39+) and removes the corresponding field from the preview API.
+	EnableNodeHardening            bool   `json:"enableNodeHardening,omitempty"`
+	KubeletClientTLSBootstrapToken string `json:"-"` // => TLSBootstrapToken in bootstrap (may need to be per node/nodepool)
+	LinuxAdminUsername             string `json:"-"`
+	SSHPublicKey                   string `json:"-"` // ssh.publicKeys.keyData => VM SSH public key // TODO: move to v1beta1.AKSNodeClass?
 
 	NetworkPlugin     string `json:"networkPlugin,omitempty"`     // => NetworkPlugin in bootstrap
 	NetworkPolicy     string `json:"networkPolicy,omitempty"`     // => NetworkPolicy in bootstrap
@@ -80,6 +111,7 @@ type Options struct {
 	KubeletIdentityClientID string   `json:"kubeletIdentityClientID,omitempty"` // => Flows to bootstrap and used in drift
 	VnetGUID                string   `json:"vnetGuid,omitempty"`                // resource guid used by azure cni for identifying the right vnet
 	SubnetID                string   `json:"subnetId,omitempty"`                // => VnetSubnetID to use (for nodes in Azure CNI Overlay and Azure CNI + pod subnet; for for nodes and pods in Azure CNI), unless overridden via AKSNodeClass
+	SystemNamespace         string   `json:"systemNamespace,omitempty"`
 	setFlags                map[string]bool
 
 	ProvisionMode              string            `json:"provisionMode,omitempty"`
@@ -91,6 +123,7 @@ type Options struct {
 	AdditionalTags             map[string]string `json:"additionalTags,omitempty"`
 	EnableAzureSDKLogging      bool              `json:"enableAzureSDKLogging,omitempty"` // Controls whether Azure SDK middleware logging is enabled
 	DiskEncryptionSetID        string            `json:"diskEncryptionSetId,omitempty"`
+	EnableFIPS                 bool              `json:"enableFIPS,omitempty"`
 
 	// If set to true, existing AKS machines created with an AKS Machine API provision mode will be managed even with other provision modes. This option does not have any effect if PROVISION_MODE is already an AKS Machine API mode, as it will behave as if this option is set to true.
 	ManageExistingAKSMachines bool `json:"manageExistingAKSMachines,omitempty"`
@@ -100,6 +133,8 @@ type Options struct {
 	ProviderBatchMaxDuration  time.Duration `json:"providerBatchMaxDuration,omitempty"`  // Maximum duration for provider batch accumulation (default 5s). Only used on provision mode aksmachineapiheaderbatch.
 	ProviderBatchMaxSize      int           `json:"providerBatchMaxSize,omitempty"`      // Maximum number of machines per provider batch (default 50, AKS API limit). Only used on provision mode aksmachineapiheaderbatch.
 
+	ComputeRecommendationMode string `json:"computeRecommendationMode,omitempty"` // Controls compute recommendation API behavior: "disabled", "log-only" (default), or "enabled".
+
 	// computed options; do not set.
 	ParsedDiskEncryptionSetID *arm.ResourceID `json:"-"`
 }
@@ -108,6 +143,7 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.StringVar(&o.ClusterName, "cluster-name", env.WithDefaultString("CLUSTER_NAME", ""), "[REQUIRED] The kubernetes cluster name for resource tags.")
 	fs.StringVar(&o.ClusterEndpoint, "cluster-endpoint", env.WithDefaultString("CLUSTER_ENDPOINT", ""), "[REQUIRED] The external kubernetes cluster endpoint for new nodes to connect with.")
 	fs.Float64Var(&o.VMMemoryOverheadPercent, "vm-memory-overhead-percent", utils.WithDefaultFloat64("VM_MEMORY_OVERHEAD_PERCENT", 0.075), "The VM memory overhead as a percent that will be subtracted from the total memory for all instance types.")
+	fs.BoolVar(&o.EnableNodeHardening, "enable-node-hardening", env.WithDefaultBool("ENABLE_NODE_HARDENING", false), "Requests AKS node hardening reservations and eviction settings where supported. This option is ignored in bootstrappingclient mode.")
 	fs.StringVar(&o.KubeletClientTLSBootstrapToken, "kubelet-bootstrap-token", env.WithDefaultString("KUBELET_BOOTSTRAP_TOKEN", ""), "[REQUIRED] The bootstrap token for new nodes to join the cluster.")
 	fs.StringVar(&o.LinuxAdminUsername, "linux-admin-username", env.WithDefaultString("LINUX_ADMIN_USERNAME", "azureuser"), "The admin username for Linux VMs.")
 	fs.StringVar(&o.SSHPublicKey, "ssh-public-key", env.WithDefaultString("SSH_PUBLIC_KEY", ""), "[REQUIRED] VM SSH public key.")
@@ -127,11 +163,13 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.StringVar(&o.SIGAccessTokenServerURL, "sig-access-token-server-url", env.WithDefaultString("SIG_ACCESS_TOKEN_SERVER_URL", ""), "The URL for the SIG access token server. Only used for AKS managed karpenter. UseSIG must be set tot true for this to take effect.")
 	fs.StringVar(&o.SIGSubscriptionID, "sig-subscription-id", env.WithDefaultString("SIG_SUBSCRIPTION_ID", ""), "The subscription ID of the shared image gallery.")
 	fs.StringVar(&o.DiskEncryptionSetID, "node-osdisk-diskencryptionset-id", env.WithDefaultString("NODE_OSDISK_DISKENCRYPTIONSET_ID", ""), "The ARM resource ID of the disk encryption set to use for customer-managed key (BYOK) encryption.")
+	fs.BoolVar(&o.EnableFIPS, "enable-fips", env.WithDefaultBool("ENABLE_FIPS", false), "If set to true, AKSNodeClasses must explicitly enable FIPS mode. This setting mirrors the AKS cluster-level FIPS configuration.")
 	fs.BoolVar(&o.ManageExistingAKSMachines, "manage-existing-aks-machines", env.WithDefaultBool("MANAGE_EXISTING_AKS_MACHINES", false), "If set to true, existing AKS machines created with an AKS Machine API provision mode will be managed even with other provision modes. This option does not have any effect when already on an AKS Machine API mode.")
-	fs.StringVar(&o.AKSMachinesPoolName, "aks-machines-pool-name", env.WithDefaultString("AKS_MACHINES_POOL_NAME", ""), "The name of the agent pool that the AKS machines are/will be in with AKS machine API provision modes. Existing AKS machines outside of this pool will be ignored. Required when PROVISION_MODE is an AKS machine API mode.")
+	fs.StringVar(&o.AKSMachinesPoolName, "aks-machines-pool-name", env.WithDefaultString("AKS_MACHINES_POOL_NAME", ""), "The name of the agent pool that the AKS machines are/will be in with AKS machine API provision modes. Existing AKS machines outside of this pool will be ignored. Required when PROVISION_MODE is an AKS machine API mode. Must be <= 6 characters if the pool will host Windows nodes, because the AKS RP composes the Windows computer name from the pool and machine names and that is bounded by the NetBIOS limit.")
 	fs.DurationVar(&o.ProviderBatchIdleDuration, "provider-batch-idle-duration", env.WithDefaultDuration("PROVIDER_BATCH_IDLE_DURATION", time.Second), "Idle duration for provider batch accumulation. Use Go duration format such as `1s`. Only used on provision mode aksmachineapiheaderbatch.")
 	fs.DurationVar(&o.ProviderBatchMaxDuration, "provider-batch-max-duration", env.WithDefaultDuration("PROVIDER_BATCH_MAX_DURATION", 5*time.Second), "Maximum duration for provider batch accumulation. Use Go duration format such as `1s`. Only used on provision mode aksmachineapiheaderbatch.")
 	fs.IntVar(&o.ProviderBatchMaxSize, "provider-batch-max-size", env.WithDefaultInt("PROVIDER_BATCH_MAX_SIZE", consts.AKSMachineAPIHeaderBatchMaxSize), fmt.Sprintf("Maximum number of machines per provider batch (AKS API limit is %d). Only used on provision mode aksmachineapiheaderbatch.", consts.AKSMachineAPIHeaderBatchMaxSize))
+	fs.StringVar(&o.ComputeRecommendationMode, "compute-recommendation-mode", env.WithDefaultString("COMPUTE_RECOMMENDATION_MODE", consts.ComputeRecommendationModeLog), "Controls compute recommendation API behavior: 'disabled' (no API calls), 'log-only' (call and log only), or 'enabled' (use for allocation).")
 
 	additionalTagsFlag := k8sflag.NewMapStringString(&o.AdditionalTags)
 	if err := additionalTagsFlag.Set(env.WithDefaultString("ADDITIONAL_TAGS", "")); err != nil {
@@ -142,9 +180,21 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.BoolVar(&o.EnableAzureSDKLogging, "enable-azure-sdk-logging", env.WithDefaultBool("ENABLE_AZURE_SDK_LOGGING", true), "If set to false then Azure SDK middleware logging is disabled for debugging, and won't be logging all HTTP requests/responses to Azure APIs.")
 }
 
+// LoadFromEnvironment loads options that are intentionally not exposed as command-line flags.
+func (o *Options) LoadFromEnvironment() {
+	o.SystemNamespace = strings.TrimSpace(os.Getenv("SYSTEM_NAMESPACE"))
+}
+
 // IsAKSMachineAPIMode returns true if the current provision mode creates instances via the AKS Machine API.
 func (o *Options) IsAKSMachineAPIMode() bool {
 	return o.ProvisionMode == consts.ProvisionModeAKSMachineAPI || o.ProvisionMode == consts.ProvisionModeAKSMachineAPIHeaderBatch
+}
+
+// ShouldUseNodeHardening returns the effective node hardening setting. Scriptless and AKS Machine
+// API modes apply matching kubelet configuration; bootstrappingclient does not and is excluded.
+func (o *Options) ShouldUseNodeHardening() bool {
+	return o.EnableNodeHardening &&
+		(o.ProvisionMode == consts.ProvisionModeAKSScriptless || o.IsAKSMachineAPIMode())
 }
 
 func (o *Options) GetAPIServerName() string {
@@ -159,6 +209,8 @@ func (o *Options) Parse(fs *coreoptions.FlagSet, args ...string) error {
 		}
 		return fmt.Errorf("parsing flags, %w", err)
 	}
+
+	o.LoadFromEnvironment()
 
 	// Check if each option has been set. This is a little brute force and better options might exist,
 	// but this only needs to be here for one version

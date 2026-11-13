@@ -26,14 +26,19 @@ const (
 	Unconsolidatable           = "Unconsolidatable"
 	ConsolidationCandidate     = "ConsolidationCandidate"
 	ConsolidationRejected      = "ConsolidationRejected"
+	ConsolidationApproved      = "ConsolidationApproved"
 
 	// provisioning/scheduling
 	FailedScheduling          = "FailedScheduling"
 	NoCompatibleInstanceTypes = "NoCompatibleInstanceTypes"
 	Nominated                 = "Nominated"
 
-	// node/health
+	// node repair
 	NodeRepairBlocked = "NodeRepairBlocked"
+
+	// nodeclaim/reboot
+	RebootObserved = "RebootObserved"
+	RebootFailed   = "RebootFailed"
 
 	// node/termination/terminator
 	Disrupted                      = "Disrupted"

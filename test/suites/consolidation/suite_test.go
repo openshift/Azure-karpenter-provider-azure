@@ -36,6 +36,8 @@ import (
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/test"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/debug"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/azure"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/common"
@@ -59,13 +61,59 @@ func TestConsolidation(t *testing.T) {
 }
 
 var _ = BeforeEach(func() {
-	nodeClass = env.DefaultAKSNodeClass()
+	nodeClass = test.AKSNodeClass()
 	env.BeforeEach()
 })
 var _ = AfterEach(func() { env.Cleanup() })
 var _ = AfterEach(func() { env.AfterEach() })
 
 var _ = Describe("Consolidation", Ordered, func() {
+	Context("Windows", func() {
+		var windowsNodeClass *v1beta1.AKSNodeClass
+		var windowsNodePool *karpv1.NodePool
+
+		BeforeEach(func() {
+			env.SkipIfNotWindowsCapable()
+			windowsNodeClass = test.AKSNodeClass(test.WithImageFamily(v1beta1.Windows2022ImageFamily))
+			windowsNodePool = env.WindowsNodePool(windowsNodeClass)
+		})
+
+		// Windows is an OS dimension on the existing consolidation behavior: a node whose only pod
+		// blocks disruption must be left alone, and the same node must be reclaimed once the
+		// workload is gone. This is the "not disrupted outside of expectations" guard for Windows.
+		It("should not consolidate a Windows node while its pod blocks disruption, then consolidate once empty", func() {
+			windowsNodePool.Spec.Disruption.ConsolidationPolicy = karpv1.ConsolidationPolicyWhenEmptyOrUnderutilized
+			windowsNodePool.Spec.Disruption.ConsolidateAfter = karpv1.MustParseNillableDuration("0s")
+
+			dep := env.WindowsDeployment(coretest.DeploymentOptions{
+				Replicas: 1,
+				PodOptions: coretest.PodOptions{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels:      map[string]string{"app": "windows-consolidation"},
+						Annotations: map[string]string{karpv1.DoNotDisruptAnnotationKey: "true"},
+					},
+					TerminationGracePeriodSeconds: lo.ToPtr[int64](0),
+				},
+			})
+			selector := labels.SelectorFromSet(dep.Spec.Selector.MatchLabels)
+
+			env.ExpectCreated(dep, windowsNodeClass, windowsNodePool)
+
+			// Windows nodes take noticeably longer to provision and pull images than Linux.
+			env.EventuallyExpectHealthyPodCountWithTimeout(25*time.Minute, selector, 1)
+			env.EventuallyExpectRegisteredNodeClaimCount("==", 1)
+			node := env.ExpectCreatedNodeCount("==", 1)[0]
+			Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelOSStable, string(corev1.Windows)))
+
+			// The do-not-disrupt pod must hold consolidation off.
+			env.ConsistentlyExpectNoDisruptions(1, 2*time.Minute)
+
+			// Once the workload is gone the Windows node is empty and must be consolidated away.
+			env.ExpectDeleted(dep)
+			env.EventuallyExpectNotFound(node)
+		})
+	})
+
 	Context("LastPodEventTime", func() {
 		var nodePool *karpv1.NodePool
 		BeforeEach(func() {
@@ -560,7 +608,7 @@ var _ = Describe("Consolidation", Ordered, func() {
 		Entry("if the nodes are spot nodes", true),
 	)
 	DescribeTable("should consolidate nodes (replace)",
-		func(spotToSpot bool) {
+		func(spotToSpot, regional bool) {
 
 			if spotToSpot {
 				if env.InClusterController {
@@ -607,6 +655,13 @@ var _ = Describe("Consolidation", Ordered, func() {
 					},
 				},
 			})
+			if regional {
+				nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, karpv1.NodeSelectorRequirementWithMinValues{
+					Key:      v1beta1.LabelPlacementScope,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{v1beta1.PlacementScopeRegional},
+				})
+			}
 			nodePool = env.AdaptToClusterConfig(nodePool)
 
 			var numPods int32 = 3
@@ -678,8 +733,27 @@ var _ = Describe("Consolidation", Ordered, func() {
 			By("checking that all pods are healthy")
 			env.EventuallyExpectHealthyPodCount(selector, int(numPods))
 
-			By("waiting for nodes (due to anti-affinity rules)")
-			env.ExpectCreatedNodeCount("==", int(numPods))
+			By("waiting for 8-CPU nodes (due to anti-affinity rules)")
+			sourceNodes := env.EventuallyExpectNodeCountWithSelector("==", int(numPods), labels.SelectorFromSet(map[string]string{
+				karpv1.NodePoolLabelKey: nodePool.Name,
+				v1beta1.LabelSKUCPU:     "8",
+			}))
+
+			if regional {
+				By("verifying regional source nodes have canonical and CSI zone labels")
+				Eventually(func(g Gomega) {
+					for _, sourceNode := range sourceNodes {
+						node := &corev1.Node{}
+						g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(sourceNode), node)).To(Succeed())
+						g.Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelTopologyZone, zones.Regional))
+						g.Expect(node.Labels).To(HaveKeyWithValue(v1beta1.LabelPlacementScope, v1beta1.PlacementScopeRegional))
+						// Azure Disk CSI publishes an empty zone for non-zonal nodes:
+						// https://github.com/kubernetes-sigs/azuredisk-csi-driver/blob/c17796139c3f65289b2e06baf20e66ec0d4b27ff/pkg/azuredisk/nodeserver.go#L352-L388
+						// (Karpenter normalizes this to the canonical regional zone "0" internally)
+						g.Expect(node.Labels).To(HaveKeyWithValue("topology.disk.csi.azure.com/zone", ""))
+					}
+				}).Should(Succeed())
+			}
 
 			By("scaling down the large deployment (leaving only small pods on each node)")
 			largeDep.Spec.Replicas = lo.ToPtr[int32](0)
@@ -709,8 +783,9 @@ var _ = Describe("Consolidation", Ordered, func() {
 
 			env.ExpectDeleted(largeDep, smallDep)
 		},
-		Entry("if the nodes are on-demand nodes", false),
-		Entry("if the nodes are spot nodes", true),
+		Entry("if the nodes are on-demand nodes", false, false),
+		Entry("if the nodes are spot nodes", true, false),
+		Entry("from regional on-demand nodes with empty CSI topology", false, true),
 	)
 	It("should consolidate on-demand nodes to spot (replace)", func() {
 		nodePool := coretest.NodePool(karpv1.NodePool{

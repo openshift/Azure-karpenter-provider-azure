@@ -43,6 +43,7 @@ import (
 type Template struct {
 	ScriptlessCustomData      string
 	ImageID                   string
+	EnableFIPS1403Encryption  bool
 	MarketplaceImage          *v1beta1.MarketplaceImage
 	SubnetID                  string
 	Tags                      map[string]*string
@@ -165,7 +166,7 @@ func (p *Provider) getStaticParameters(
 	}
 
 	subnetID := lo.Ternary(nodeClass.Spec.VNETSubnetID != nil, lo.FromPtr(nodeClass.Spec.VNETSubnetID), options.FromContext(ctx).SubnetID)
-	baseLabels, err := karplabels.Get(ctx, nodeClass, arch)
+	baseLabels, err := karplabels.Get(ctx, nodeClass, arch, instanceType.Requirements)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +250,7 @@ func (p *Provider) getOpenShiftTemplate(ctx context.Context, nodeClass *v1beta1.
 func (p *Provider) createLaunchTemplate(ctx context.Context, params *parameters.Parameters) (*Template, error) {
 	template := &Template{
 		ImageID:                   params.ImageID,
+		EnableFIPS1403Encryption:  params.EnableFIPS1403Encryption,
 		SubnetID:                  params.SubnetID,
 		IsWindows:                 params.IsWindows,
 		StorageProfileDiskType:    params.StorageProfileDiskType,

@@ -26,6 +26,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	azkarptest "github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/azure"
 
@@ -67,7 +68,7 @@ func TestStorage(t *testing.T) {
 
 var _ = BeforeEach(func() {
 	env.BeforeEach()
-	nodeClass = env.DefaultAKSNodeClass()
+	nodeClass = azkarptest.AKSNodeClass()
 	nodePool = env.DefaultNodePool(nodeClass)
 })
 var _ = AfterEach(func() { env.Cleanup() })
@@ -242,6 +243,58 @@ var _ = Describe("Persistent Volumes", func() {
 			env.ExpectCreated(nodeClass, nodePool, storageClass, pod)
 			env.EventuallyExpectHealthy(pod)
 			env.ExpectCreatedNodeCount("==", 1)
+		})
+		It("should schedule a pod with a regional PV whose CSI topology zone is empty", Label("runner"), func() {
+			storageClass.Parameters = map[string]string{"skuname": "Standard_LRS"}
+			storageClass.VolumeBindingMode = lo.ToPtr(storagev1.VolumeBindingImmediate)
+
+			pvc := test.PersistentVolumeClaim(test.PersistentVolumeClaimOptions{
+				StorageClassName: &storageClass.Name,
+			})
+
+			By("provisioning a regional disk before node selection")
+			env.ExpectCreated(nodeClass, nodePool, storageClass, pvc)
+			pv := env.EventuallyExpectPVCBound(pvc)
+
+			By("verifying the PV exposes an empty CSI zone")
+			Expect(pv.Spec.NodeAffinity).ToNot(BeNil())
+			Expect(pv.Spec.NodeAffinity.Required).ToNot(BeNil())
+			csiZoneRequirement, ok := lo.Find(lo.FlatMap(pv.Spec.NodeAffinity.Required.NodeSelectorTerms, func(term corev1.NodeSelectorTerm, _ int) []corev1.NodeSelectorRequirement {
+				return term.MatchExpressions
+			}), func(requirement corev1.NodeSelectorRequirement) bool {
+				return requirement.Key == "topology.disk.csi.azure.com/zone"
+			})
+			Expect(ok).To(BeTrue())
+			Expect(csiZoneRequirement).To(Equal(corev1.NodeSelectorRequirement{
+				Key:      "topology.disk.csi.azure.com/zone",
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{""},
+			}))
+
+			deployment := test.Deployment(test.DeploymentOptions{Replicas: 1, PodOptions: test.PodOptions{
+				PersistentVolumeClaims: []string{pvc.Name},
+			}})
+			deployment.Spec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
+				Name:      deployment.Spec.Template.Spec.Volumes[0].Name,
+				MountPath: "/mnt/regional-disk",
+			}}
+
+			By("scheduling a pod from the regional PV")
+			env.ExpectCreated(deployment)
+			nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+			zoneRequirement, ok := lo.Find(nodeClaim.Spec.Requirements, func(requirement karpv1.NodeSelectorRequirementWithMinValues) bool {
+				return requirement.Key == corev1.LabelTopologyZone
+			})
+			Expect(ok).To(BeTrue())
+			Expect(zoneRequirement.Operator).To(Equal(corev1.NodeSelectorOpIn))
+			Expect(zoneRequirement.Values).To(ConsistOf(zones.Regional))
+
+			By("verifying regional placement")
+			pods := env.EventuallyExpectHealthyDeployment(deployment)
+			env.ExpectCreatedNodeCount("==", 1)
+			node := env.GetNode(pods[0].Spec.NodeName)
+			Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelTopologyZone, zones.Regional))
+			Expect(node.Labels).To(HaveKeyWithValue(v1beta1.LabelPlacementScope, v1beta1.PlacementScopeRegional))
 		})
 		// Validates the sigs.k8s.io/karpenter fix (PR kubernetes-sigs/karpenter#2743) to schedule pods
 		// on nodes in specific zones, even when PV is accessible in multiple zones.
@@ -435,6 +488,40 @@ var _ = Describe("Ephemeral Storage", func() {
 		env.ExpectCreated(nodeClass, nodePool, pod)
 		env.EventuallyExpectHealthy(pod)
 		env.ExpectCreatedNodeCount("==", 1)
+	})
+	It("should not advertise more ephemeral storage than the registered node", func() {
+		deployment := test.Deployment(test.DeploymentOptions{Replicas: 1, PodOptions: test.PodOptions{
+			ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+				},
+			},
+		}})
+
+		env.ExpectCreated(nodeClass, nodePool, deployment)
+		pods := env.EventuallyExpectHealthyDeployment(deployment)
+		nodeClaim := env.EventuallyExpectCreatedNodeClaimCount("==", 1)[0]
+		node := env.GetNode(pods[0].Spec.NodeName)
+
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+			g.Expect(env.Client.Get(env.Context, client.ObjectKeyFromObject(node), node)).To(Succeed())
+
+			modeledCapacity := nodeClaim.Status.Capacity[corev1.ResourceEphemeralStorage]
+			actualCapacity := node.Status.Capacity[corev1.ResourceEphemeralStorage]
+			modeledAllocatable := nodeClaim.Status.Allocatable[corev1.ResourceEphemeralStorage]
+			actualAllocatable := node.Status.Allocatable[corev1.ResourceEphemeralStorage]
+			g.Expect(modeledCapacity.IsZero()).To(BeFalse())
+			g.Expect(actualCapacity.IsZero()).To(BeFalse())
+			g.Expect(modeledAllocatable.IsZero()).To(BeFalse())
+			g.Expect(actualAllocatable.IsZero()).To(BeFalse())
+			quantities := fmt.Sprintf(
+				"modeled-capacity=%d actual-capacity=%d modeled-allocatable=%d actual-allocatable=%d",
+				modeledCapacity.Value(), actualCapacity.Value(), modeledAllocatable.Value(), actualAllocatable.Value(),
+			)
+			g.Expect(modeledCapacity.Cmp(actualCapacity)).To(BeNumerically("<=", 0), quantities)
+			g.Expect(modeledAllocatable.Cmp(actualAllocatable)).To(BeNumerically("<=", 0), quantities)
+		}).Should(Succeed())
 	})
 	It("should run a pod with ephemeral storage that uses memory-backed emptyDir", func() {
 		// Use a direct pod because the test exercises pod-local emptyDir storage directly.

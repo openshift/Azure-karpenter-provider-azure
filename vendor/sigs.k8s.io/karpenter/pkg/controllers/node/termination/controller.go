@@ -204,7 +204,7 @@ func (c *Controller) awaitDrain(
 	if nodeClaim != nil && nodeClaim.StatusConditions().Get(v1.ConditionTypeDrained) == nil {
 		nodeClaim.StatusConditions(status.WithClock(c.clock)).SetUnknownWithReason(v1.ConditionTypeDrained, "Draining", "Draining")
 	}
-	if err := c.terminator.Drain(ctx, node, nodeTerminationTime); err != nil {
+	if err := c.terminator.Drain(ctx, node, nodeTerminationTime, terminator.ForceDelete); err != nil {
 		if !terminator.IsNodeDrainError(err) {
 			return reconcile.Result{}, fmt.Errorf("draining node, %w", err)
 		}
@@ -327,7 +327,7 @@ func filterVolumeAttachments(ctx context.Context, kubeClient client.Client, node
 		return volumeAttachments, nil
 	}
 	// Create list of non-drain-able Pods associated with Node
-	pods, err := nodeutils.GetPods(ctx, kubeClient, node)
+	pods, err := nodeutils.GetPods(ctx, kubeClient, node.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +372,7 @@ func (c *Controller) removeFinalizer(ctx context.Context, n *corev1.Node) error 
 
 		metrics.NodesTerminatedTotal.Inc(map[string]string{
 			metrics.NodePoolLabel: n.Labels[v1.NodePoolLabelKey],
+			metrics.ZoneLabel:     n.Labels[corev1.LabelTopologyZone],
 		})
 
 		// We use stored.DeletionTimestamp since the api-server may give back a node after the patch without a deletionTimestamp

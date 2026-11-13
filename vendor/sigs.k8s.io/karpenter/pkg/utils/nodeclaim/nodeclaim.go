@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,12 +36,45 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
 func IsManaged(nodeClaim *v1.NodeClaim, cp cloudprovider.CloudProvider) bool {
 	return lo.ContainsBy(cp.GetSupportedNodeClasses(), func(nodeClass status.Object) bool {
 		return object.GVK(nodeClass).GroupKind() == nodeClaim.Spec.NodeClassRef.GroupKind()
 	})
+}
+
+// DisruptionTerminationMode returns the termination_mode metric label value for a
+// disrupted NodeClaim, derived from its terminationGracePeriod.
+func DisruptionTerminationMode(nodeClaim *v1.NodeClaim) string {
+	if nodeClaim == nil || nodeClaim.Spec.TerminationGracePeriod == nil {
+		return metrics.TerminationModeGraceful
+	}
+	if nodeClaim.Spec.TerminationGracePeriod.Duration <= 0 {
+		return metrics.TerminationModeForceful
+	}
+	return metrics.TerminationModeEventual
+}
+
+// PatchTerminationTimestampAnnotation sets the termination timestamp annotation using optimistic locking.
+func PatchTerminationTimestampAnnotation(ctx context.Context, kubeClient client.Client, nodeClaim *v1.NodeClaim, terminationTime time.Time) error {
+	stored := nodeClaim.DeepCopy()
+	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+		v1.NodeClaimTerminationTimestampAnnotationKey: terminationTime.Format(time.RFC3339),
+	})
+	return kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+}
+
+// TightenTerminationTimestampAnnotation sets the termination timestamp annotation to terminationTime unless the
+// NodeClaim already has an earlier one, so a deadline can be tightened but never extended.
+func TightenTerminationTimestampAnnotation(ctx context.Context, kubeClient client.Client, nodeClaim *v1.NodeClaim, terminationTime time.Time) error {
+	if value, ok := nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; ok {
+		if existing, err := time.Parse(time.RFC3339, value); err == nil && !existing.After(terminationTime) {
+			return nil
+		}
+	}
+	return PatchTerminationTimestampAnnotation(ctx, kubeClient, nodeClaim, terminationTime)
 }
 
 // IsManagedPredicateFuncs is used to filter controller-runtime NodeClaim watches to NodeClaims managed by the given cloudprovider.
@@ -106,6 +141,40 @@ func NodeEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider
 		// Because we get so many NodeClaims from this response, we are not DeepCopying the cached data here
 		// DO NOT MUTATE NodeClaims in this function as this will affect the underlying cached NodeClaim
 		ncs, err := ListManaged(ctx, c, cloudProvider, ForProviderID(o.(*corev1.Node).Spec.ProviderID), client.UnsafeDisableDeepCopy)
+		if err != nil {
+			return nil
+		}
+		return lo.Map(ncs, func(nc *v1.NodeClaim, _ int) reconcile.Request {
+			return reconcile.Request{NamespacedName: client.ObjectKeyFromObject(nc)}
+		})
+	})
+}
+
+// ResourceSliceEventHandler is a watcher on resourcev1.ResourceSlice that maps a slice to the NodeClaim(s) backing the
+// node the slice is local to (via spec.nodeName or a Node owner reference) and enqueues reconcile.Requests for them.
+// It lets the lifecycle controller re-evaluate initialization when a DRA driver publishes its slices.
+func ResourceSliceEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider) handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
+		slice := o.(*resourcev1.ResourceSlice)
+		nodeName := lo.FromPtr(slice.Spec.NodeName)
+		if nodeName == "" {
+			for _, ref := range slice.OwnerReferences {
+				if ref.Kind == "Node" {
+					nodeName = ref.Name
+					break
+				}
+			}
+		}
+		if nodeName == "" {
+			return nil
+		}
+		node := &corev1.Node{}
+		if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+			return nil
+		}
+		// Because we get so many NodeClaims from this response, we are not DeepCopying the cached data here
+		// DO NOT MUTATE NodeClaims in this function as this will affect the underlying cached NodeClaim
+		ncs, err := ListManaged(ctx, c, cloudProvider, ForProviderID(node.Spec.ProviderID), client.UnsafeDisableDeepCopy)
 		if err != nil {
 			return nil
 		}
@@ -245,7 +314,7 @@ func UpdateNodeOwnerReferences(nodeClaim *v1.NodeClaim, node *corev1.Node) *core
 		Kind:               gvk.Kind,
 		Name:               nodeClaim.Name,
 		UID:                nodeClaim.UID,
-		BlockOwnerDeletion: lo.ToPtr(true),
+		BlockOwnerDeletion: new(true),
 	})
 	return node
 }

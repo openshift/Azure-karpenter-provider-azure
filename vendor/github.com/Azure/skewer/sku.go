@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2022-08-01/compute" //nolint:staticcheck
 	"github.com/pkg/errors"
@@ -37,11 +38,12 @@ func (e *ErrCapabilityValueNil) Error() string {
 type ErrCapabilityValueParse struct {
 	capability string
 	value      string
+	dataType   string
 	err        error
 }
 
 func (e *ErrCapabilityValueParse) Error() string {
-	return fmt.Sprintf("%sCapabilityValueParse: failed to parse string '%s' as int64, error: '%s'", e.capability, e.value, e.err)
+	return fmt.Sprintf("%sCapabilityValueParse: failed to parse string '%s' as %s, error: '%s'", e.capability, e.value, e.dataType, e.err)
 }
 
 // VCPU returns the number of vCPUs this SKU supports.
@@ -138,10 +140,36 @@ func (s *SKU) IsHyperVGen2Supported() bool {
 	return s.HasCapabilityWithSeparator(HyperVGenerations, HyperVGeneration2)
 }
 
+// IsNestedVirtualizationSupported returns true when the VM size supports nested virtualization.
+func (s *SKU) IsNestedVirtualizationSupported() bool {
+	return supportsNestedVirtualization(s.GetSize()) ||
+		s.HasCapabilityWithSeparator(SupportedVirtualizationTypes, NestedVirtualization)
+}
+
+// IsDirectVirtualizationSupported returns true when the VM size supports direct virtualization.
+func (s *SKU) IsDirectVirtualizationSupported() bool {
+	return supportsDirectVirtualization(s.GetSize()) ||
+		s.HasCapabilityWithSeparator(SupportedVirtualizationTypes, DirectVirtualization)
+}
+
 // GetCPUArchitectureType returns cpu arch for the VM size.
 // It errors if value is nil or not found.
 func (s *SKU) GetCPUArchitectureType() (string, error) {
 	return s.GetCapabilityString(CapabilityCPUArchitectureType)
+}
+
+// GetRetirementDate returns the retirement date for the VM SKU. A SKU without
+// a retirement date returns nil.
+func (s *SKU) GetRetirementDate() (*time.Time, error) {
+	retirementDate, err := s.GetCapabilityDate(RetirementDateUTC)
+	var capabilityNotFound *ErrCapabilityNotFound
+	if errors.As(err, &capabilityNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &retirementDate, nil
 }
 
 // GetCapabilityIntegerQuantity retrieves and parses the value of an
@@ -157,7 +185,7 @@ func (s *SKU) GetCapabilityIntegerQuantity(name string) (int64, error) {
 			if capability.Value != nil {
 				intVal, err := strconv.ParseInt(*capability.Value, ten, sixtyFour)
 				if err != nil {
-					return -1, &ErrCapabilityValueParse{name, *capability.Value, err}
+					return -1, &ErrCapabilityValueParse{name, *capability.Value, "int64", err}
 				}
 				return intVal, nil
 			}
@@ -180,7 +208,7 @@ func (s *SKU) GetCapabilityFloatQuantity(name string) (float64, error) {
 			if capability.Value != nil {
 				intVal, err := strconv.ParseFloat(*capability.Value, sixtyFour)
 				if err != nil {
-					return -1, &ErrCapabilityValueParse{name, *capability.Value, err}
+					return -1, &ErrCapabilityValueParse{name, *capability.Value, "float64", err}
 				}
 				return intVal, nil
 			}
@@ -205,6 +233,21 @@ func (s *SKU) GetCapabilityString(name string) (string, error) {
 		}
 	}
 	return "", &ErrCapabilityNotFound{name}
+}
+
+// GetCapabilityDate retrieves and parses an MM/DD/YYYY capability value.
+// It errors if the capability is not found, the value was nil, or the value
+// could not be parsed as a date.
+func (s *SKU) GetCapabilityDate(name string) (time.Time, error) {
+	value, err := s.GetCapabilityString(name)
+	if err != nil {
+		return time.Time{}, err
+	}
+	date, err := time.Parse("01/02/2006", value)
+	if err != nil {
+		return time.Time{}, &ErrCapabilityValueParse{name, value, "time.Time", err}
+	}
+	return date, nil
 }
 
 // HasCapability return true for a capability which can be either
@@ -494,9 +537,19 @@ func (s *SKU) HasLocationRestriction(location string) bool {
 	return false
 }
 
-// IsConfidentialComputingTypeSNP return true if ConfidentialComputingType is SNP for this sku.
+// IsConfidentialComputingTypeSNP returns true if ConfidentialComputingType is SNP for this sku.
 func (s *SKU) IsConfidentialComputingTypeSNP() (bool, error) {
 	return s.HasCapabilityWithSeparator(CapabilityConfidentialComputingType, ConfidentialComputingTypeSNP), nil
+}
+
+// IsConfidentialComputingTypeTDX returns true if ConfidentialComputingType is TDX for this sku.
+func (s *SKU) IsConfidentialComputingTypeTDX() (bool, error) {
+	return s.HasCapabilityWithSeparator(CapabilityConfidentialComputingType, ConfidentialComputingTypeTDX), nil
+}
+
+// IsNestedSNPSupported returns true if the SKU supports an SNP confidential child VM.
+func (s *SKU) IsNestedSNPSupported() bool {
+	return supportsNestedSNP(s.GetSize())
 }
 
 // Official documentation for Trusted Launch states:

@@ -53,6 +53,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/quota"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 )
@@ -136,15 +137,23 @@ type Resource = map[string]interface{}
 type VirtualMachinePromise struct {
 	VM       *armcompute.VirtualMachine
 	WaitFunc func() error
+	// CreateIssued is false when an existing VM was reused.
+	CreateIssued bool
 
-	providerRef VMProvider
+	providerRef   *DefaultVMProvider
+	nodeClaim     *karpv1.NodeClaim
+	quotaMetadata quotaMetadata
 }
 
 func (p *VirtualMachinePromise) Cleanup(ctx context.Context) error {
 	// This won't clean up leaked NICs if the VM doesn't exist... intentional?
 	// From Delete(): "Leftover network interfaces (if any) will be cleaned by by GC controller"
 	// Still, we could try to DeleteNic()?
-	return p.providerRef.Delete(ctx, lo.FromPtr(p.VM.Name))
+	gone, err := p.providerRef.deleteImpl(ctx, lo.FromPtr(p.VM.Name))
+	if gone {
+		p.providerRef.quotaLifecycle.recordDelete(p.nodeClaim, p.quotaMetadata)
+	}
+	return err
 }
 
 func (p *VirtualMachinePromise) Wait() error {
@@ -158,7 +167,7 @@ type VMProvider interface {
 	BeginCreate(context.Context, *v1beta1.AKSNodeClass, *karpv1.NodeClaim, []*corecloudprovider.InstanceType) (*VirtualMachinePromise, error)
 	Get(context.Context, string) (*armcompute.VirtualMachine, error)
 	List(context.Context) ([]*armcompute.VirtualMachine, error)
-	Delete(context.Context, string) error
+	Delete(context.Context, *karpv1.NodeClaim, string) error
 	Update(context.Context, string, armcompute.VirtualMachineUpdate) error
 	GetNic(context.Context, string, string) (*armnetwork.Interface, error)
 	DeleteNic(context.Context, string) error
@@ -186,6 +195,10 @@ type DefaultVMProvider struct {
 	vmListQuery, nicListQuery string
 	deletingVMs               sets.Set[string] // tracks in-flight delete operations by VM name
 	deletingVMsMu             sync.RWMutex
+	quotaLifecycle            *quotaLifecycle
+
+	nicListQueryWithAKSMachines string // Temporary. This is to help mitigate CCM bug where it incorrectly creates unused NICs by enabling garbage collection from Karpenter.
+	// Should be safe to remove once https://github.com/kubernetes-sigs/cloud-provider-azure/pull/11267 is rolled out.
 }
 
 func NewDefaultVMProvider(
@@ -202,6 +215,7 @@ func NewDefaultVMProvider(
 	provisionMode string,
 	diskEncryptionSetID string,
 	env *auth.Environment,
+	quotaProvider quota.Provider,
 ) *DefaultVMProvider {
 	return &DefaultVMProvider{
 		azClient:                     azClient,
@@ -217,11 +231,13 @@ func NewDefaultVMProvider(
 		diskEncryptionSetID:          diskEncryptionSetID,
 		env:                          env,
 
-		vmListQuery:  GetVMListQueryBuilder(resourceGroup).String(),
-		nicListQuery: GetNICListQueryBuilder(resourceGroup).String(),
+		vmListQuery:                 GetVMListQueryBuilder(resourceGroup).String(),
+		nicListQuery:                GetNICListQueryBuilder(resourceGroup, false).String(),
+		nicListQueryWithAKSMachines: GetNICListQueryBuilder(resourceGroup, true).String(),
 
-		errorHandling: offerings.NewResponseErrorHandler(offeringsCache),
-		deletingVMs:   sets.New[string](),
+		errorHandling:  offerings.NewResponseErrorHandler(offeringsCache),
+		deletingVMs:    sets.New[string](),
+		quotaLifecycle: newQuotaLifecycle(quotaProvider, instanceTypeProvider),
 	}
 }
 
@@ -236,6 +252,7 @@ func (p *DefaultVMProvider) BeginCreate(
 	nodeClaim *karpv1.NodeClaim,
 	instanceTypes []*corecloudprovider.InstanceType,
 ) (*VirtualMachinePromise, error) {
+	quotaGeneration := p.quotaLifecycle.snapshotGeneration()
 	vmPromise, err := p.beginLaunchInstance(ctx, nodeClass, nodeClaim, instanceTypes)
 	if err != nil {
 		// There may be orphan NICs (created before promise started)
@@ -244,6 +261,16 @@ func (p *DefaultVMProvider) BeginCreate(
 			log.FromContext(ctx).Error(cleanupErr, "failed to cleanup resources for node claim", "NodeClaim", nodeClaim.Name)
 		}
 		return nil, err
+	}
+	vmPromise.nodeClaim = nodeClaim
+	if vmPromise.CreateIssued {
+		vmPromise.quotaMetadata = p.quotaLifecycle.metadata(
+			ctx,
+			string(lo.FromPtr(vmPromise.VM.Properties.HardwareProfile.VMSize)),
+			GetCapacityTypeFromVM(vmPromise.VM),
+			CapacityReservationGroupID(vmPromise.VM) != "",
+		)
+		p.quotaLifecycle.recordCreate(quotaGeneration, nodeClaim, vmPromise.quotaMetadata)
 	}
 	vm := vmPromise.VM
 	zone, err := zones.MakeAKSLabelZoneFromVM(vm)
@@ -360,13 +387,21 @@ func (p *DefaultVMProvider) List(ctx context.Context) ([]*armcompute.VirtualMach
 	return vmList, nil
 }
 
-func (p *DefaultVMProvider) Delete(ctx context.Context, resourceName string) error {
+func (p *DefaultVMProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim, resourceName string) error {
+	gone, err := p.deleteImpl(ctx, resourceName)
+	if gone {
+		p.quotaLifecycle.recordDeleteFromNodeClaim(ctx, nodeClaim)
+	}
+	return err
+}
+
+func (p *DefaultVMProvider) deleteImpl(ctx context.Context, resourceName string) (bool, error) {
 	// If there's already an in-flight delete for this VM, return immediately.
 	p.deletingVMsMu.RLock()
 	deleting := p.deletingVMs.Has(resourceName)
 	p.deletingVMsMu.RUnlock()
 	if deleting {
-		return nil
+		return false, nil
 	}
 
 	// Note that 'Get' also satisfies cloudprovider.Delete contract expectation (from v1.3.0)
@@ -377,16 +412,19 @@ func (p *DefaultVMProvider) Delete(ctx context.Context, resourceName string) err
 	// Since get quota is generally higher, we prefer to check w/ get rather than issue 2 deletes.
 	vm, err := p.Get(ctx, resourceName)
 	if err != nil {
-		return err
+		return corecloudprovider.IsNodeClaimNotFoundError(err), err
 	}
 	// Check if the instance is already shutting down to reduce the number of API calls.
 	// Leftover network interfaces (if any) will be cleaned by by GC controller.
 	if utils.IsVMDeleting(*vm) {
-		return nil
+		return false, nil
 	}
 
 	log.FromContext(ctx).V(1).Info("deleting virtual machine and associated resources", "vmName", resourceName)
-	return p.cleanupAzureResources(ctx, resourceName, false)
+	if err := p.cleanupAzureResources(ctx, resourceName, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (p *DefaultVMProvider) GetNic(ctx context.Context, rg, nicName string) (*armnetwork.Interface, error) {
@@ -399,7 +437,14 @@ func (p *DefaultVMProvider) GetNic(ctx context.Context, rg, nicName string) (*ar
 
 // ListNics returns all network interfaces in the resource group that have the nodepool tag
 func (p *DefaultVMProvider) ListNics(ctx context.Context) ([]*armnetwork.Interface, error) {
-	req := NewQueryRequest(&(p.subscriptionID), p.nicListQuery)
+	nicListQuery := p.nicListQuery
+	// Temporary. This is to help mitigate CCM bug where it incorrectly creates unused NICs by enabling garbage collection from Karpenter.
+	// Should be safe to remove once https://github.com/kubernetes-sigs/cloud-provider-azure/pull/11267 is rolled out.
+	// ASSUMPTION: This ListNics is only used for NIC garbage collection only or won't hurt seeing NICs from machine path.
+	if shouldAKSMachinesBeVisible(ctx) {
+		nicListQuery = p.nicListQueryWithAKSMachines
+	}
+	req := NewQueryRequest(&(p.subscriptionID), nicListQuery)
 	client := p.azClient.AzureResourceGraphClient()
 	data, err := GetResourceData(ctx, client, *req)
 	if err != nil {
@@ -452,7 +497,7 @@ func (p *DefaultVMProvider) createCSExtension(ctx context.Context, vmName string
 }
 
 func (p *DefaultVMProvider) newNetworkInterfaceForVM(opts *createNICOptions) armnetwork.Interface {
-	var ipv4BackendPools []*armnetwork.BackendAddressPool
+	ipv4BackendPools := make([]*armnetwork.BackendAddressPool, 0, len(opts.BackendPools.IPv4PoolIDs))
 	for _, poolID := range opts.BackendPools.IPv4PoolIDs {
 		ipv4BackendPools = append(ipv4BackendPools, &armnetwork.BackendAddressPool{
 			ID: &poolID,
@@ -557,6 +602,7 @@ type createVMOptions struct {
 	UseSIG              bool
 	DiskEncryptionSetID string
 	NodePoolName        string
+	UltraSSDEnabled     bool
 }
 
 // newVMObject creates a new armcompute.VirtualMachine from the provided options
@@ -582,7 +628,7 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 			StorageProfile: &armcompute.StorageProfile{
 				OSDisk: &armcompute.OSDisk{
 					Name:         lo.ToPtr(opts.VMName),
-					DiskSizeGB:   opts.NodeClass.Spec.OSDiskSizeGB,
+					DiskSizeGB:   lo.ToPtr(opts.LaunchTemplate.StorageProfileSizeGB),
 					CreateOption: lo.ToPtr(armcompute.DiskCreateOptionTypesFromImage),
 					DeleteOption: lo.ToPtr(armcompute.DiskDeleteOptionTypesDelete),
 				},
@@ -635,6 +681,8 @@ func newVMObject(opts *createVMOptions) *armcompute.VirtualMachine {
 	}
 	setVMPropertiesBillingProfile(vm.Properties, opts.CapacityType)
 	setVMPropertiesSecurityProfile(vm.Properties, opts.NodeClass)
+	setVMPropertiesAdditionalCapabilities(vm.Properties, opts.UltraSSDEnabled, opts.LaunchTemplate.EnableFIPS1403Encryption)
+	setVMPropertiesCapacityReservation(vm.Properties, opts.NodeClass)
 
 	switch opts.ProvisionMode {
 	case consts.ProvisionModeBootstrappingClient:
@@ -694,12 +742,68 @@ func setVMPropertiesBillingProfile(vmProperties *armcompute.VirtualMachineProper
 }
 
 func setVMPropertiesSecurityProfile(vmProperties *armcompute.VirtualMachineProperties, nodeClass *v1beta1.AKSNodeClass) {
-	if nodeClass.Spec.Security != nil && nodeClass.Spec.Security.EncryptionAtHost != nil {
+	if nodeClass.Spec.Security == nil {
+		return
+	}
+
+	if nodeClass.Spec.Security.EncryptionAtHost != nil {
 		if vmProperties.SecurityProfile == nil {
 			vmProperties.SecurityProfile = &armcompute.SecurityProfile{}
 		}
 		vmProperties.SecurityProfile.EncryptionAtHost = nodeClass.Spec.Security.EncryptionAtHost
 	}
+
+	if nodeClass.IsTrustedLaunchEnabled() {
+		if vmProperties.SecurityProfile == nil {
+			vmProperties.SecurityProfile = &armcompute.SecurityProfile{}
+		}
+
+		if vmProperties.SecurityProfile.SecurityType == nil {
+			vmProperties.SecurityProfile.SecurityType = lo.ToPtr(armcompute.SecurityTypesTrustedLaunch)
+		}
+
+		if vmProperties.SecurityProfile.UefiSettings == nil {
+			vmProperties.SecurityProfile.UefiSettings = &armcompute.UefiSettings{
+				SecureBootEnabled: lo.ToPtr(nodeClass.IsSecureBootEnabled()),
+				VTpmEnabled:       lo.ToPtr(nodeClass.IsVTPMEnabled()),
+			}
+		}
+	}
+}
+
+func setVMPropertiesAdditionalCapabilities(vmProperties *armcompute.VirtualMachineProperties, ultraSSDEnabled, fips1403EncryptionEnabled bool) {
+	if (ultraSSDEnabled || fips1403EncryptionEnabled) && vmProperties.AdditionalCapabilities == nil {
+		vmProperties.AdditionalCapabilities = &armcompute.AdditionalCapabilities{}
+	}
+	if ultraSSDEnabled {
+		vmProperties.AdditionalCapabilities.UltraSSDEnabled = &ultraSSDEnabled
+	}
+	if fips1403EncryptionEnabled {
+		vmProperties.AdditionalCapabilities.EnableFips1403Encryption = &fips1403EncryptionEnabled
+	}
+}
+
+// setVMPropertiesCapacityReservation associates the VM with the Capacity Reservation
+// Group named by the NodeClass. A regional group requires the VM to carry no zone,
+// which zones.MakeARMZonesFromAKSLabelZone guarantees for the regional placement.
+func setVMPropertiesCapacityReservation(vmProperties *armcompute.VirtualMachineProperties, nodeClass *v1beta1.AKSNodeClass) {
+	groupID := nodeClass.GetCapacityReservationGroupID()
+	if groupID == "" {
+		return
+	}
+	vmProperties.CapacityReservation = &armcompute.CapacityReservationProfile{
+		CapacityReservationGroup: &armcompute.SubResource{ID: lo.ToPtr(groupID)},
+	}
+}
+
+func CapacityReservationGroupID(vm *armcompute.VirtualMachine) string {
+	if vm == nil ||
+		vm.Properties == nil ||
+		vm.Properties.CapacityReservation == nil ||
+		vm.Properties.CapacityReservation.CapacityReservationGroup == nil {
+		return ""
+	}
+	return lo.FromPtr(vm.Properties.CapacityReservation.CapacityReservationGroup.ID)
 }
 
 type createResult struct {
@@ -707,28 +811,22 @@ type createResult struct {
 	VM     *armcompute.VirtualMachine
 }
 
-// createVirtualMachine creates a new VM using the provided options or skips the creation of a vm if it already exists, which means opts is not guaranteed except VMName
+// validateExistingCapacityReservation refuses to adopt a VM left behind by an earlier
+// attempt whose capacity reservation group differs from what the NodeClass asks for now.
+// Adopting it would record the current group on the NodeClaim along with the current
+// NodeClass hash, so the claim would assert an association the VM does not have and drift
+// would never notice. Returning an error instead deletes it, since BeginCreate cleans up
+// the VM and its NIC on a synchronous launch failure.
+func validateExistingCapacityReservation(vm *armcompute.VirtualMachine, nodeClass *v1beta1.AKSNodeClass) error {
+	actual := CapacityReservationGroupID(vm)
+	if err := validateCapacityReservationGroupAssociation(actual, nodeClass.GetCapacityReservationGroupID()); err != nil {
+		return fmt.Errorf("existing VM %q %w", lo.FromPtr(vm.Name), err)
+	}
+	return nil
+}
+
+// createVirtualMachine creates a new VM using the provided options.
 func (p *DefaultVMProvider) createVirtualMachine(ctx context.Context, opts *createVMOptions) (*createResult, error) {
-	// We assume that if a vm exists, we successfully created it with the right parameters from the nodeclaims during another run before a restart.
-	// there are some non-deterministic properties that may change.
-	// Zones: zones are non-detrminsitic as we do a random pick out of zones on the nodeclaim that satisfy the workload requirements.
-	// 	      Nodeclaim can have Requirements: Zone-1, Zone-2, Zone-3
-	//        Then we pick a random zone from that list in each create call that satisfies the workload
-	// UnavailableOfferingsCache: The unavailable offerings cache is used to determine if we should pick the sku, zone, or even priority.
-	//        Errors for things like subscription level spot quota, SKU Quota, etc are stored in the unavailable offerings cache.
-	//        So values like the SKU, Priority(Spot/On-Demand), may be different, which results in a different image, different
-	//        os.CustomData.
-	// If any of these properties are modified, the existing vm will return a 409 status code "PropertyChangeNotAllowed".
-	// this results in create being blocked on the nodeclaim until liveness TTL is hit.
-	resp, err := p.azClient.VirtualMachinesClient().Get(ctx, p.resourceGroup, opts.VMName, nil)
-	// If status == ok, we want to return the existing vmm
-	if err == nil {
-		return &createResult{VM: &resp.VirtualMachine}, nil
-	}
-	// if status != ok, and for a reason other than we did not find the vm
-	if !sdkerrors.IsNotFoundErr(err) {
-		return nil, fmt.Errorf("getting VM %q: %w", opts.VMName, err)
-	}
 	vm := newVMObject(opts)
 	log.FromContext(ctx).V(1).Info("creating virtual machine", "vmName", opts.VMName, logging.InstanceType, opts.InstanceType.Name)
 	VMCreateStartMetric.With(map[string]string{
@@ -755,6 +853,28 @@ func (p *DefaultVMProvider) createVirtualMachine(ctx context.Context, opts *crea
 	return &createResult{Poller: poller, VM: vm}, nil
 }
 
+func resolveUltraSSDRequested(nodeClaim *karpv1.NodeClaim) bool {
+	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+
+	compatibleWithTrue := reqs.Compatible(scheduling.NewRequirements(
+		scheduling.NewRequirement(v1beta1.LabelUltraSSD, v1.NodeSelectorOpIn, "true"))) == nil
+	compatibleWithFalse := reqs.Compatible(scheduling.NewRequirements(
+		scheduling.NewRequirement(v1beta1.LabelUltraSSD, v1.NodeSelectorOpIn, "false"))) == nil
+
+	// We only enable if the NodeClaim is explicitly requesting it. Ambiguous or unspecified requests result in false.
+	return compatibleWithTrue && !compatibleWithFalse
+}
+
+func filterBackendPools(pools *loadbalancer.BackendAddressPools, nodeClaim *karpv1.NodeClaim) *loadbalancer.BackendAddressPools {
+	// Azure CCM's updateNodeCaches adds nodes to its load balancer exclusion cache based on label
+	// presence, regardless of value. Match that here so initial NIC backend pool assignment agrees.
+	// https://github.com/kubernetes-sigs/cloud-provider-azure/blob/e2712175252faaf96b39313b303f94b79a1d1171/pkg/provider/azure.go#L851-L868
+	if _, hasLabel := nodeClaim.Labels[v1.LabelNodeExcludeBalancers]; hasLabel {
+		return pools.WithoutKubernetesInboundPools()
+	}
+	return pools
+}
+
 // beginLaunchInstance starts the launch of a VM instance.
 // The returned VirtualMachinePromise must be called to gather any errors
 // that are retrieved during async provisioning, as well as to complete the provisioning process.
@@ -766,6 +886,39 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	nodeClaim *karpv1.NodeClaim,
 	instanceTypes []*corecloudprovider.InstanceType,
 ) (*VirtualMachinePromise, error) {
+	// We assume that if a vm exists, we successfully created it with the right parameters from the nodeclaims during another run before a restart.
+	// there are some non-deterministic properties that may change.
+	// Zones: zones are non-detrminsitic as we do a random pick out of zones on the nodeclaim that satisfy the workload requirements.
+	// 	      Nodeclaim can have Requirements: Zone-1, Zone-2, Zone-3
+	//        Then we pick a random zone from that list in each create call that satisfies the workload
+	// UnavailableOfferingsCache: The unavailable offerings cache is used to determine if we should pick the sku, zone, or even priority.
+	//        Errors for things like subscription level spot quota, SKU Quota, etc are stored in the unavailable offerings cache.
+	//        So values like the SKU, Priority(Spot/On-Demand), may be different, which results in a different image, different
+	//        os.CustomData.
+	// If any of these properties are modified, the existing vm will return a 409 status code "PropertyChangeNotAllowed".
+	// this results in create being blocked on the nodeclaim until liveness TTL is hit.
+	resourceName := GenerateResourceName(nodeClaim.Name)
+	existing, err := p.azClient.VirtualMachinesClient().Get(ctx, p.resourceGroup, resourceName, nil)
+	// If status == ok, we want to return the existing vmm
+	if err == nil {
+		// TODO: Replace this field-specific check with ownership and launch-intent
+		// validation before reusing an existing VM. Other NodeClass inputs that configure
+		// immutable VM properties can also change between creation attempts.
+		if err := validateExistingCapacityReservation(&existing.VirtualMachine, nodeClass); err != nil {
+			return nil, err
+		}
+		return &VirtualMachinePromise{
+			VM:           &existing.VirtualMachine,
+			WaitFunc:     func() error { return nil },
+			CreateIssued: false,
+			providerRef:  p,
+		}, nil
+	}
+	// if status != ok, and for a reason other than we did not find the vm
+	if !sdkerrors.IsNotFoundErr(err) {
+		return nil, fmt.Errorf("getting VM %q: %w", resourceName, err)
+	}
+
 	selection := p.allocationStrategyProvider.Allocate(
 		ctx,
 		instanceTypes,
@@ -776,20 +929,20 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	}
 	instanceType := selection.InstanceType
 	capacityType := selection.CapacityType()
+
+	ultraSSD := resolveUltraSSDRequested(nodeClaim)
 	zone := selection.Zone()
 	placementScope := selection.PlacementScope()
-	launchTemplate, err := p.getLaunchTemplate(ctx, nodeClass, nodeClaim, instanceType, capacityType, placementScope)
+	launchTemplate, err := p.getLaunchTemplate(ctx, nodeClass, nodeClaim, instanceType, capacityType, placementScope, ultraSSD)
 	if err != nil {
 		return nil, fmt.Errorf("getting launch template: %w", err)
 	}
-
-	// resourceName for the NIC, VM, and Disk
-	resourceName := GenerateResourceName(nodeClaim.Name)
 
 	backendPools, err := p.loadBalancerProvider.LoadBalancerBackendPools(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting backend pools: %w", err)
 	}
+	backendPools = filterBackendPools(backendPools, nodeClaim)
 	networkPlugin := options.FromContext(ctx).NetworkPlugin
 	networkPluginMode := options.FromContext(ctx).NetworkPluginMode
 
@@ -810,19 +963,30 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	// TODO: doing so would bypass the capacity and other errors that are currently handled by
 	// TODO: core pkg/controllers/nodeclaim/lifecycle/controller.go - in particular, there are metrics/events
 	// TODO: emitted in capacity failure cases that we probably want.
-	nicReference, err := p.createNetworkInterface(
-		ctx,
-		&createNICOptions{
-			NICName:                resourceName,
-			NetworkPlugin:          networkPlugin,
-			NetworkPluginMode:      networkPluginMode,
-			MaxPods:                utils.GetMaxPods(nodeClass, networkPlugin, networkPluginMode),
-			LaunchTemplate:         launchTemplate,
-			BackendPools:           backendPools,
-			InstanceType:           instanceType,
-			NetworkSecurityGroupID: nsgID,
-		},
-	)
+	nicOpts := &createNICOptions{
+		NICName:                resourceName,
+		NetworkPlugin:          networkPlugin,
+		NetworkPluginMode:      networkPluginMode,
+		MaxPods:                utils.GetMaxPods(nodeClass, networkPlugin, networkPluginMode),
+		LaunchTemplate:         launchTemplate,
+		BackendPools:           backendPools,
+		InstanceType:           instanceType,
+		NetworkSecurityGroupID: nsgID,
+	}
+
+	nicReference, err := p.createNetworkInterface(ctx, nicOpts)
+	if err != nil && isMissingSubmittedBackendPool(err, backendPools) {
+		log.FromContext(ctx).Info("network interface creation failed due to stale load balancer backend pool reference, refreshing",
+			"nicName", resourceName,
+			"error", err)
+		refreshedPools, refreshErr := p.loadBalancerProvider.RefreshBackendPools(ctx, backendPools)
+		if refreshErr != nil {
+			return nil, fmt.Errorf("refreshing backend pools after network interface failure: %w", refreshErr)
+		}
+		nicOpts.BackendPools = filterBackendPools(refreshedPools, nodeClaim)
+		// Try again
+		nicReference, err = p.createNetworkInterface(ctx, nicOpts)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -843,13 +1007,14 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		UseSIG:              options.FromContext(ctx).UseSIG,
 		DiskEncryptionSetID: p.diskEncryptionSetID,
 		NodePoolName:        nodeClaim.Labels[karpv1.NodePoolLabelKey],
+		UltraSSDEnabled:     ultraSSD,
 	})
 	if err != nil {
 		sku, skuErr := p.instanceTypeProvider.Get(ctx, instanceType.Name)
 		if skuErr != nil {
 			return nil, fmt.Errorf("failed to get instance type %q: %w", instanceType.Name, err)
 		}
-		handledError := p.errorHandling.Handle(ctx, sku, instanceType, zone, capacityType, err)
+		handledError := p.errorHandling.Handle(ctx, sku, instanceType, zone, capacityType, nodeClass.GetCapacityReservationGroupID(), err)
 		if handledError != nil {
 			// At this point, the error is handled in provider layer (e.g., unavailable offerings cache), but not yet Karpenter core.
 			// Thus the error needs to be returned.
@@ -867,7 +1032,8 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	result.VM.Properties.TimeCreated = lo.ToPtr(time.Now())
 
 	return &VirtualMachinePromise{
-		providerRef: p,
+		providerRef:  p,
+		CreateIssued: result.Poller != nil, // Poller is nil means the VM existed already.
 		WaitFunc: func() error {
 			if result.Poller == nil {
 				// Poller is nil means the VM existed already and we're done.
@@ -893,7 +1059,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 				if skuErr != nil {
 					return fmt.Errorf("failed to get instance type %q: %w", instanceType.Name, err)
 				}
-				handledError := p.errorHandling.Handle(ctx, sku, instanceType, zone, capacityType, err)
+				handledError := p.errorHandling.Handle(ctx, sku, instanceType, zone, capacityType, nodeClass.GetCapacityReservationGroupID(), err)
 				if handledError != nil {
 					// At this point, the error is handled in provider layer (e.g., unavailable offerings cache), but not yet Karpenter core.
 					// Thus the error needs to be returned.
@@ -938,6 +1104,7 @@ func (p *DefaultVMProvider) getLaunchTemplate(
 	instanceType *corecloudprovider.InstanceType,
 	capacityType string,
 	placementScope string,
+	ultraSSD bool,
 ) (*launchtemplate.Template, error) {
 	// We need to get all single-valued requirement labels from the instance type and the nodeClaim to pass down to kubelet.
 	// We don't just include single-value labels from the instance type because in the case where the label is NOT single-value on the instance
@@ -953,6 +1120,7 @@ func (p *DefaultVMProvider) getLaunchTemplate(
 		map[string]string{
 			karpv1.CapacityTypeLabelKey: capacityType,
 			v1beta1.LabelPlacementScope: placementScope,
+			v1beta1.LabelUltraSSD:       fmt.Sprint(ultraSSD),
 		},
 	)
 
@@ -1129,4 +1297,11 @@ func GetPriorityLabelFromVM(vm *armcompute.VirtualMachine) string {
 		return VMPriorityToPriority[*vm.Properties.Priority]
 	}
 	return ""
+}
+
+func GetUltraSSDEnabled(vm *armcompute.VirtualMachine) bool {
+	if vm != nil && vm.Properties != nil && vm.Properties.AdditionalCapabilities != nil {
+		return lo.FromPtr(vm.Properties.AdditionalCapabilities.UltraSSDEnabled)
+	}
+	return false
 }

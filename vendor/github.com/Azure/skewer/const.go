@@ -49,8 +49,10 @@ const (
 	CapabilityTrustedLaunchDisabled = "TrustedLaunchDisabled"
 	// CapabilityConfidentialComputingType identifies the type of ConfidentialComputing.
 	CapabilityConfidentialComputingType = "ConfidentialComputingType"
-	// ConfidentialComputingTypeSNP denoted the "SNP" ConfidentialComputing.
+	// ConfidentialComputingTypeSNP denotes the "SNP" ConfidentialComputing type.
 	ConfidentialComputingTypeSNP = "SNP"
+	// ConfidentialComputingTypeTDX denotes the "TDX" ConfidentialComputing type.
+	ConfidentialComputingTypeTDX = "TDX"
 	// DiskControllerTypes identifies the disk controller types supported by the VM SKU.
 	DiskControllerTypes = "DiskControllerTypes"
 	// SupportedEphemeralOSDiskPlacements identifies supported ephemeral OS disk placements.
@@ -59,6 +61,14 @@ const (
 	NvmeDiskSizeInMiB = "NvmeDiskSizeInMiB"
 	// LowPriorityCapable identifies the capability for low priority VM support.
 	LowPriorityCapable = "LowPriorityCapable"
+	// SupportedVirtualizationTypes identifies the virtualization types supported by the VM SKU.
+	SupportedVirtualizationTypes = "SupportedVirtualizationTypes"
+	// NestedVirtualization identifies nested virtualization support.
+	NestedVirtualization = "NestedVirtualization"
+	// DirectVirtualization identifies direct virtualization support.
+	DirectVirtualization = "DirectVirtualization"
+	// RetirementDateUTC identifies the retirement date for the VM SKU.
+	RetirementDateUTC = "RetirementDateUtc"
 )
 
 const (

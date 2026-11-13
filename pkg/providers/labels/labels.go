@@ -25,6 +25,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/localdns"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
@@ -84,10 +85,20 @@ const (
 	LabelArch = "beta.kubernetes.io/arch"
 )
 
+// setKataNodeLabel stamps the Kata (Pod Sandboxing) node label when the NodeClass requests it,
+// matching the requirement advertised by the instance type provider (see computeRequirements).
+func setKataNodeLabel(labels map[string]string, nodeClass *v1beta1.AKSNodeClass) {
+	if !nodeClass.IsKataEnabled() {
+		return
+	}
+	labels[v1beta1.AKSLabelKataVMIsolation] = "true"
+}
+
 func Get(
 	ctx context.Context,
 	nodeClass *v1beta1.AKSNodeClass,
 	arch string,
+	instanceTypeRequirements scheduling.Requirements,
 ) (map[string]string, error) {
 	labels := map[string]string{}
 	opts := options.FromContext(ctx)
@@ -114,14 +125,15 @@ func Get(
 	labels[v1beta1.AKSLabelPriority] = v1beta1.PriorityRegular
 	// Add os-sku label based on imageFamily
 	labels[v1beta1.AKSLabelOSSKU] = v1beta1.GetOSSKUFromImageFamily(lo.FromPtr(nodeClass.Spec.ImageFamily))
-	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS {
+	if nodeClass.IsFIPSEnabled() {
 		labels[v1beta1.AKSLabelFIPSEnabled] = "true"
 	}
+	setKataNodeLabel(labels, nodeClass)
 
 	// Add os-sku-requested label that exactly matches the imageFamily specified on the NodeClass
 	labels[v1beta1.AKSLabelOSSKURequested] = lo.FromPtr(nodeClass.Spec.ImageFamily)
 	// nil static parameters here is safe only because we're not using the resulting imageFamily for anything except to get its name
-	imageFamily := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, nil)
+	imageFamily := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, nodeClass.IsTrustedLaunchEnabled(), kubernetesVersion, nil)
 	labels[v1beta1.AKSLabelOSSKUEffective] = imageFamily.Name()
 
 	if opts.IsAzureCNIOverlay() {
@@ -153,7 +165,11 @@ func Get(
 		labels[AKSLabelEBPFDataplane] = consts.NetworkDataplaneCilium
 	}
 
-	if nodeClass.IsLocalDNSEnabled() {
+	// LocalDNS is a per-node decision, not a per-NodeClass one: under
+	// Mode=Preferred a VM size below the LocalDNS floor runs without it while its
+	// larger siblings in the same NodePool run with it. Label what this node
+	// actually gets, so the users can see which nodes got which configuration.
+	if localdns.IsSupportedForInstanceType(nodeClass, instanceTypeRequirements) {
 		labels[AKSLocalDNSStateLabelKey] = "enabled"
 	} else {
 		labels[AKSLocalDNSStateLabelKey] = "disabled"

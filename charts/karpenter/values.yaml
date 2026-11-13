@@ -81,7 +81,9 @@ dnsConfig: {}
 #  options:
 #    - name: ndots
 #      value: "1"
-# -- Node selectors to schedule the pod to nodes with labels.
+# -- Node selectors to schedule the pod to nodes with labels. Note: the controller is a
+# Linux-only component, so `kubernetes.io/os: linux` is always enforced by the chart (even
+# if overridden here) to keep it off Windows nodes in hybrid clusters.
 nodeSelector:
   kubernetes.io/os: linux
 # -- Affinity rules for scheduling the pod. If an explicit label selector is not provided for pod affinity or pod anti-affinity one will be created from the pod selector labels.
@@ -201,14 +203,29 @@ settings:
   # -- How the Karpenter scheduler treats min values. Options include 'Strict' (fails scheduling when min values can't be met) and 'BestEffort' (relaxes min values when they can't be met).
   minValuesPolicy: ""
   # -- When set, Karpenter ignores pods' Dynamic Resource Allocation requests during scheduling simulations.
-  # This flag will be removed once formal DRA support is GA in Karpenter.
-  ignoreDRARequests: false
+  # DRA is not supported by the Azure provider, so this must remain enabled until support, RBAC, and validation are implemented.
+  ignoreDRARequests: true
+  # -- Run the legacy forceful repair controller by default when nodeRepair is enabled.
+  # Set to false to opt into budget-aware repair.
+  # The legacy controller does not support terminateFirstRepair or the karpenter.sh/do-not-repair annotation.
+  legacyNodeRepair: true
   # -- Disable cluster state metrics and events.
   disableClusterStateObservability: false
+
+  # -- Controls compute recommendation API behavior.
+  # "disabled": No API calls are made to the compute recommendation API.
+  # "log-only" (default): API is called and results are logged, but local ranking is used for allocation.
+  # "enabled": API results actively influence allocation decisions.
+  computeRecommendationMode: "log-only"
 
   # -- Feature Gate configuration values. Feature Gates will follow the same graduation process and requirements as feature gates
   # in Kubernetes. More information here https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/#feature-gates-for-alpha-or-beta-features
   featureGates:
+    # -- capacityBuffer is ALPHA and is disabled by default.
+    # Setting this to true enables provisioning and lifecycle management for CapacityBuffer resources.
+    # On upgrades, install the release-matched CapacityBuffer CRD first; Helm does not install CRDs on upgrade.
+    # See docs/capacity-buffer.md for the standalone CRD chart and main-chart upgrade paths.
+    capacityBuffer: false
     # -- reservedCapacity is BETA and is disabled until Azure provider support is implemented.
     # Setting this to true only enables the core feature gate; Azure reserved capacity provisioning is not implemented yet.
     reservedCapacity: false
@@ -216,7 +233,8 @@ settings:
     # Setting this to true will enable spot replacement consolidation for both single and multi-node consolidation.
     spotToSpotConsolidation: false
     # -- nodeRepair is ALPHA and is disabled by default.
-    # Setting this to true will enable node repair.
+    # Setting this to true enables replacement of unhealthy nodes.
+    # Set legacyNodeRepair=false to use NodePool disruption budgets.
     nodeRepair: false
     # -- nodeOverlay is ALPHA and is disabled by default.
     # Setting this will allow the use of node overlay to impact scheduling decisions.
@@ -224,3 +242,12 @@ settings:
     # -- staticCapacity is ALPHA and is disabled by default.
     # Setting this to true will enable static capacity provisioning.
     staticCapacity: false
+    # -- terminateFirstDrift is ALPHA and is disabled by default.
+    # Allows drift to terminate before replacing a node in a capacity-constrained NodePool.
+    terminateFirstDrift: false
+    # -- terminateFirstRepair is ALPHA and is disabled by default.
+    # Allows repair to terminate before replacing a node in a capacity-constrained NodePool. Requires nodeRepair.
+    terminateFirstRepair: false
+    # -- podDeletionCostManagement is ALPHA and is disabled by default.
+    # Manages ReplicaSet pods' deletion-cost annotations and grants patch permission on pods.
+    podDeletionCostManagement: false

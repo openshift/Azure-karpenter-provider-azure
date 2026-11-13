@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -36,17 +37,23 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
 const (
-	GracefulDisruptionClass = "graceful" // graceful disruption always respects blocking pod PDBs and the do-not-disrupt annotation
-	EventualDisruptionClass = "eventual" // eventual disruption is bounded by a NodePool's TerminationGracePeriod, regardless of blocking pod PDBs and the do-not-disrupt annotation
+	GracefulDisruptionClass = metrics.TerminationModeGraceful // graceful disruption always respects blocking pod PDBs and the do-not-disrupt annotation
+	EventualDisruptionClass = metrics.TerminationModeEventual // eventual disruption is bounded by a NodePool's TerminationGracePeriod, regardless of blocking pod PDBs and the do-not-disrupt annotation
+	// RepairDisruptionClass is voluntary node repair. Like graceful, it drains and honors PDBs; unlike graceful, it
+	// ignores the Node-level do-not-disrupt annotation and honors the separate do-not-repair veto. Pod-level
+	// do-not-disrupt and PDB blockers are honored until a configured repair drain bound expires; 0 skips the drain.
+	RepairDisruptionClass = "repair"
 )
 
 type MethodOptions struct {
@@ -79,31 +86,102 @@ type Candidate struct {
 	capacityType      string
 	DisruptionCost    float64
 	reschedulablePods []*corev1.Pod
+	hasPodBlockers    bool
+
+	// Price is the cheapest compatible offering price for this candidate.
+	// Precomputed at creation to avoid repeated offering lookups.
+	Price float64
+	// RescheduleDisruptionCost is 1.0 (base) + sum of positive pod eviction costs
+	// for reschedulable pods. Used by balanced scoring.
+	RescheduleDisruptionCost float64
+	// TerminationGracePeriod, when set, bounds this candidate's drain. After any required replacements are ready, the
+	// queue stamps the absolute termination deadline (now + this) immediately before requesting deletion, so
+	// replacement-launch latency doesn't erode the window. nil inherits the NodeClaim's own TerminationGracePeriod.
+	// Repair sets it (min(policy, NodeClaim TGP)) in ComputeCommands.
+	TerminationGracePeriod *time.Duration
+	// RepairPolicyResult is the policy decision for this candidate's current node snapshot. ShouldDisrupt populates it,
+	// so a repair pass evaluates each candidate once before sorting and constructing a command.
+	RepairPolicyResult health.RepairResult
+	// RebootEscalated reports that recent reboot history converted a reboot decision to replacement.
+	RebootEscalated bool
+}
+
+// ScoreResult holds the three values needed to decide whether a move passes.
+type ScoreResult struct {
+	SavingsFraction    float64
+	DisruptionFraction float64
+	K                  int32
+}
+
+// Score is savings/disruption, guarded for zero denominators and non-positive savings.
+func (r ScoreResult) Score() float64 {
+	if r.SavingsFraction <= 0 {
+		return 0
+	}
+	if r.DisruptionFraction == 0 {
+		return math.Inf(1)
+	}
+	return r.SavingsFraction / r.DisruptionFraction
+}
+
+func (r ScoreResult) Threshold() float64 { return 1.0 / float64(r.K) }
+func (r ScoreResult) Approved() bool     { return r.Score() >= r.Threshold() }
+
+// SavingsRatio returns cost per unit disruption (higher = prefer to disrupt).
+// Delegates to disruptionutils.SavingsRatio so the balanced-consolidation
+// candidate sort and pod-deletion-cost ranking read the same formula.
+func (c *Candidate) SavingsRatio() float64 {
+	return disruptionutils.SavingsRatio(c.Price, c.RescheduleDisruptionCost)
 }
 
 func (c *Candidate) OwnedByStaticNodePool() bool {
 	return c.NodePool.Spec.Replicas != nil
 }
 
-//nolint:gocyclo
+// IsEmpty reports that no pod contributes positive reschedule disruption cost.
+// A node with running pods whose eviction costs all clamp to zero is Empty under
+// this definition; the Empty disruption reason and Empty budgets govern its
+// deletion through the Emptiness method.
+func (c *Candidate) IsEmpty() bool {
+	return c.RescheduleDisruptionCost <= disruptionutils.PerNodeBaseDisruptionCost
+}
+
+//nolint:gocyclo // Candidate validation is clearer as one linear workflow.
 func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
 ) (*Candidate, error) {
-	var err error
-	var pods []*corev1.Pod
 	// If the orchestration queue is already considering a candidate we want to disrupt, don't consider it a candidate.
 	if queue.HasAny(node.ProviderID()) {
 		return nil, fmt.Errorf("candidate is already being disrupted")
 	}
-	if err = node.ValidateNodeDisruptable(clk); err != nil {
-		// Only emit an event if the NodeClaim is not nil, ensuring that we only emit events for Karpenter-managed nodes
-		if node.NodeClaim != nil {
-			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
+	if disruptionClass == RepairDisruptionClass && node.NodeClaim != nil && node.Labels()[v1.NodePoolLabelKey] == "" {
+		recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim,
+			"repair requires a NodePool to construct and budget a safe replacement")...)
+		return nil, serrors.Wrap(fmt.Errorf("repair requires a nodepool"), "NodeClaim", klog.KObj(node.NodeClaim))
+	}
+
+	err := node.ValidateNodeDisruptable(clk)
+	if err != nil {
+		// Repair is voluntary but is NOT discretionary: do-not-disrupt was never intended to strand a broken node.
+		// Nor is a node that never initializes left stranded, since nothing else replaces it.
+		if disruptionClass == RepairDisruptionClass {
+			err = state.IgnoreNodeUninitializedError(state.IgnoreNodeDoNotDisruptError(err))
 		}
-		return nil, err
+		if err != nil {
+			// Only emit an event for Karpenter-managed nodes.
+			if node.NodeClaim != nil {
+				recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
+			}
+			err = fmt.Errorf("validating node for disruption, %w", err)
+			if node.Node == nil || !node.Registered() {
+				return nil, serrors.Wrap(err, "NodeClaim", klog.KObj(node.NodeClaim))
+			}
+			return nil, serrors.Wrap(err, "Node", klog.KObj(node.Node))
+		}
 	}
 	// We know that the node will have the label key because of the node.IsDisruptable check above
 	nodePoolName := node.Labels()[v1.NodePoolLabelKey]
+	// nodePool is a shared cache-backed pointer; treat as read-only. DeepCopy before mutating.
 	nodePool := nodePoolMap[nodePoolName]
 	instanceTypeMap := nodePoolToInstanceTypesMap[nodePoolName]
 	// skip any candidates where we can't determine the nodePool
@@ -113,30 +191,42 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
-	if pods, err = node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder); err != nil {
-		// If the NodeClaim has a TerminationGracePeriod set and the disruption class is eventual, the node should be
-		// considered a candidate even if there's a pod that will block eviction. Other error types should still cause
-		// failure creating the candidate.
-		eventualDisruptionCandidate := node.NodeClaim.Spec.TerminationGracePeriod != nil && disruptionClass == EventualDisruptionClass
-		if lo.Ternary(eventualDisruptionCandidate, state.IgnorePodBlockEvictionError(err), err) != nil {
+	pods, err := node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder)
+	hasPodBlockers := false
+	if err != nil {
+		// Repair resolves its policy deadline after candidate construction, so retain whether pod blockers were ignored
+		// and let Repair reject an unbounded candidate. Eventual disruption already knows its NodeClaim drain bound.
+		validationErr := err
+		switch {
+		case disruptionClass == RepairDisruptionClass:
+			validationErr = state.IgnorePodBlockEvictionError(err)
+			hasPodBlockers = validationErr == nil
+		case disruptionClass == EventualDisruptionClass && node.NodeClaim.Spec.TerminationGracePeriod != nil:
+			validationErr = state.IgnorePodBlockEvictionError(err)
+		}
+		if validationErr != nil {
 			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
-			return nil, err
+			return nil, serrors.Wrap(fmt.Errorf("validating pod disruption, %w", err), "Node", klog.KObj(node.Node))
 		}
 	}
+	reschedulable := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return pod.IsReschedulable(p) })
 	return &Candidate{
 		StateNode:         node,
 		instanceType:      instanceType,
 		NodePool:          nodePool,
 		capacityType:      node.Labels()[v1.CapacityTypeLabelKey],
 		zone:              node.Labels()[corev1.LabelTopologyZone],
-		reschedulablePods: lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return pod.IsReschedulable(p) }),
+		reschedulablePods: reschedulable,
+		hasPodBlockers:    hasPodBlockers,
 		// We get the disruption cost from all pods in the candidate, not just the reschedulable pods
-		DisruptionCost: disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim),
+		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim),
+		Price:                    disruptionutils.ResolveOfferingPrice(node.Labels(), instanceType),
+		RescheduleDisruptionCost: disruptionutils.ComputeRescheduleDisruptionCost(ctx, reschedulable),
 	}, nil
 }
 
 type Replacement struct {
-	*scheduling.NodeClaim
+	*pscheduling.NodeClaim
 
 	Name string
 	// Use a bool track if a node has already been initialized so we can fire metrics for initialization once.
@@ -145,8 +235,8 @@ type Replacement struct {
 	Initialized bool
 }
 
-func replacementsFromNodeClaims(newNodeClaims ...*scheduling.NodeClaim) []*Replacement {
-	return lo.Map(newNodeClaims, func(n *scheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} })
+func replacementsFromNodeClaims(newNodeClaims ...*pscheduling.NodeClaim) []*Replacement {
+	return lo.Map(newNodeClaims, func(n *pscheduling.NodeClaim, _ int) *Replacement { return &Replacement{NodeClaim: n} })
 }
 
 type Command struct {
@@ -157,9 +247,23 @@ type Command struct {
 	CreationTimestamp time.Time
 	ID                uuid.UUID
 
-	Results      scheduling.Results
-	Candidates   []*Candidate
-	Replacements []*Replacement
+	Results             pscheduling.Results
+	Candidates          []*Candidate
+	Replacements        []*Replacement
+	PoolDisruptionCosts map[string]float64
+	// TerminateFirstReason marks a delete-only terminate-first command (RFC #3203) with why its replacement couldn't be
+	// staged first; Decision() surfaces it as TerminateFirstDecision.
+	TerminateFirstReason TerminateFirstReason
+	// Reboot is already handed off to its controller, so the queue only records the decision.
+	Reboot bool
+}
+
+// Reason returns the disruption reason for this command.
+func (c Command) Reason() v1.DisruptionReason {
+	if c.Method == nil {
+		return ""
+	}
+	return c.Method.Reason()
 }
 
 type Decision string
@@ -168,17 +272,71 @@ var (
 	NoOpDecision    Decision = "no-op"
 	ReplaceDecision Decision = "replace"
 	DeleteDecision  Decision = "delete"
+	// TerminateFirstDecision is a delete-only decision distinguished from DeleteDecision for terminate-first (RFC #3203).
+	TerminateFirstDecision Decision = "terminate-first"
+	RebootDecision         Decision = "reboot"
+	// ApprovedDecision and RejectedDecision are the decision label values emitted
+	// by the Balanced consolidation move metrics (consolidation_moves_total and
+	// consolidation_score).
+	ApprovedDecision Decision = "approved"
+	RejectedDecision Decision = "rejected"
+)
+
+// TerminateFirstReason is why a terminate-first command couldn't stage its replacement first.
+type TerminateFirstReason string
+
+const (
+	// TerminateFirstNoReservedCapacity means the replacement has no reserved capacity to launch into except the slot the
+	// node holds in a full capacity reservation.
+	TerminateFirstNoReservedCapacity TerminateFirstReason = "no-reserved-capacity"
+	// TerminateFirstStaticAtLimit means a static NodePool at its node limit can't launch the replacement alongside the node.
+	TerminateFirstStaticAtLimit TerminateFirstReason = "static-at-limit"
 )
 
 func (c Command) Decision() Decision {
 	switch {
+	case len(c.Candidates) > 0 && c.Reboot:
+		return RebootDecision
 	case len(c.Candidates) > 0 && len(c.Replacements) > 0:
 		return ReplaceDecision
 	case len(c.Candidates) > 0 && len(c.Replacements) == 0:
+		if c.TerminateFirstReason != "" {
+			return TerminateFirstDecision
+		}
 		return DeleteDecision
 	default:
 		return NoOpDecision
 	}
+}
+
+// PoolDisruptionCost returns the disruption cost for a given pool. If the
+// pre-computed map is populated, it reads from there; otherwise it falls back
+// to computing from candidates (for backwards compat in tests).
+func (c Command) PoolDisruptionCost(poolName string) float64 {
+	if c.PoolDisruptionCosts != nil {
+		return c.PoolDisruptionCosts[poolName]
+	}
+	// Fallback: compute from candidates directly.
+	var cost float64
+	for _, cand := range c.Candidates {
+		if cand.NodePool.Name == poolName {
+			cost += cand.RescheduleDisruptionCost
+		}
+	}
+	return cost
+}
+
+// computePoolDisruptionCosts groups candidates by NodePool name and sums
+// RescheduleDisruptionCost per group.
+func computePoolDisruptionCosts(candidates []*Candidate) map[string]float64 {
+	if len(candidates) == 0 {
+		return nil
+	}
+	costs := make(map[string]float64, len(candidates))
+	for _, c := range candidates {
+		costs[c.NodePool.Name] += c.RescheduleDisruptionCost
+	}
+	return costs
 }
 
 // SourceNodeNames returns the names of all candidate nodes
@@ -236,24 +394,37 @@ func (c Command) StringForNode(candidate *Candidate) string {
 	return fmt.Sprintf("%s: [%s] (part of %d-node consolidation)", c.Decision(), candidate.Name(), len(c.Candidates))
 }
 
+// SourceCost sums Price across all candidates in this command.
+func (c Command) SourceCost() float64 {
+	return lo.SumBy(c.Candidates, func(cd *Candidate) float64 { return cd.Price })
+}
+
 // EstimatedSavings returns the estimated cost savings from this consolidation.
-// Returns 0.0 when pricing cannot be determined. getCandidatePrices handles missing
-// offerings by returning 0.0, which causes consolidation to skip the candidate.
+// Unknown prices degrade silently: an unpriceable source node carries Price 0
+// (see disruptionutils.ResolveOfferingPrice) and deflates savings, while a
+// replacement with no available compatible offering contributes 0 to
+// destination cost and inflates them.
 func (c Command) EstimatedSavings() float64 {
-	sourcePrice := getCandidatePrices(c.Candidates)
+	// A reboot keeps the instance, so it saves nothing.
+	if c.Reboot {
+		return 0
+	}
+	sourcePrice := c.SourceCost()
 
 	// For delete consolidation, all source cost is savings
 	if len(c.Replacements) == 0 {
 		return sourcePrice
 	}
 
-	// For replace consolidation, sum destination costs from all replacement NodeClaims
+	// For replace consolidation, sum destination costs from all replacement NodeClaims.
 	destPrice := 0.0
 	for _, nodeClaim := range c.Results.NewNodeClaims {
 		if len(nodeClaim.InstanceTypeOptions) > 0 {
-			offerings := nodeClaim.InstanceTypeOptions[0].Offerings
-			if len(offerings) > 0 {
-				destPrice += offerings.Cheapest().Price
+			launchable := nodeClaim.InstanceTypeOptions[0].Offerings.
+				Launchable().                      // Launchable (not just Available): a full reservation is Available at ~0 price but launches at OD/spot, which would overstate savings.
+				Compatible(nodeClaim.Requirements) // Filter to only consider allowed offerings
+			if len(launchable) > 0 {
+				destPrice += launchable.Cheapest().Price
 			}
 		}
 	}
@@ -279,12 +450,17 @@ func (c Command) LogValues() []any {
 	podCount := lo.Reduce(c.Candidates, func(acc int, cd *Candidate, _ int) int { return acc + len(cd.reschedulablePods) }, 0)
 
 	candidateNodes := lo.Map(c.Candidates, func(candidate *Candidate, _ int) any {
-		return map[string]any{
+		m := map[string]any{
 			"Node":          klog.KObj(candidate.Node),
 			"NodeClaim":     klog.KObj(candidate.NodeClaim),
 			"instance-type": candidate.Labels()[corev1.LabelInstanceTypeStable],
 			"capacity-type": candidate.Labels()[v1.CapacityTypeLabelKey],
 		}
+		// Logged with the command rather than at resolution, so it appears once when the escalated replacement runs.
+		if candidate.RebootEscalated {
+			m["reboot-escalated"] = true
+		}
+		return m
 	})
 	replacementNodes := lo.Map(c.Replacements, func(replacement *Replacement, _ int) any {
 		ct := replacement.Requirements.Get(v1.CapacityTypeLabelKey)
@@ -296,7 +472,7 @@ func (c Command) LogValues() []any {
 			).Else(v1.CapacityTypeOnDemand),
 		}
 		if len(c.Replacements) == 1 {
-			m["instance-types"] = scheduling.InstanceTypeList(replacement.InstanceTypeOptions)
+			m["instance-types"] = pscheduling.InstanceTypeList(replacement.InstanceTypeOptions)
 		}
 		return m
 	})

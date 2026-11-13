@@ -32,10 +32,12 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
+	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/sku"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/environment/azure"
 	"github.com/Azure/karpenter-provider-azure/test/pkg/newskus"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
@@ -84,10 +86,12 @@ func TestNewSKUs(t *testing.T) {
 	RegisterFailHandler(Fail)
 	BeforeSuite(func() {
 		env = azure.NewEnvironment(t)
-		// Now that we have env, check for unsupported types and quota, updating Reason on each case
+		// Now that we have env, check for unsupported types, regional availability, and quota
+		availableSKUs := fetchAvailableSKUs(env)
 		quotaMap := fetchQuotaMap(env)
 		for _, tc := range familyTestCases {
 			checkUnsupported(tc)
+			checkAvailability(tc, availableSKUs, env.Region)
 			checkQuota(tc, quotaMap)
 		}
 		GinkgoWriter.Printf("Discovered %d canonical families to test\n", len(familyTestCases))
@@ -101,7 +105,7 @@ func TestNewSKUs(t *testing.T) {
 
 var _ = BeforeEach(func() {
 	env.BeforeEach()
-	nodeClass = env.DefaultAKSNodeClass()
+	nodeClass = test.AKSNodeClass()
 	nodePool = env.DefaultNodePool(nodeClass)
 })
 var _ = AfterEach(func() { env.Cleanup() })
@@ -193,7 +197,7 @@ func buildFamilyTestCases(entries []instancetype.SKUEntry) []*FamilyTestCase {
 	keys := lo.Keys(groups)
 	sort.Strings(keys)
 
-	var cases []*FamilyTestCase
+	cases := make([]*FamilyTestCase, 0, len(keys))
 	for _, key := range keys {
 		skus := groups[key]
 		rep := newskus.PickRepresentativeSize(skus)
@@ -292,6 +296,52 @@ func checkQuota(tc *FamilyTestCase, quotaMap map[string]int64) {
 			available,
 			needed,
 			tc.Family)
+	}
+}
+
+// fetchAvailableSKUs queries the Resource SKUs API for the test region and returns
+// the set of VM size names that are registered in that region.
+func fetchAvailableSKUs(env *azure.Environment) sets.Set[string] {
+	available := sets.New[string]()
+	skuClient, err := armcompute.NewResourceSKUsClient(env.SubscriptionID, env.GetDefaultCredential(), nil)
+	if err != nil {
+		GinkgoWriter.Printf("WARNING: failed to create Resource SKUs client: %v\n", err)
+		return available
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	filter := fmt.Sprintf("location eq '%s'", env.Region)
+	pager := skuClient.NewListPager(&armcompute.ResourceSKUsClientListOptions{
+		Filter: &filter,
+	})
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			GinkgoWriter.Printf("WARNING: failed to fetch Resource SKUs page: %v\n", err)
+			break
+		}
+		for _, s := range page.Value {
+			if lo.FromPtr(s.ResourceType) == "virtualMachines" {
+				available.Insert(lo.FromPtr(s.Name))
+			}
+		}
+	}
+	GinkgoWriter.Printf("Fetched %d VM SKUs available in region %s\n", available.Len(), env.Region)
+	return available
+}
+
+// checkAvailability checks if the representative VM size is registered in the
+// Resource SKUs API for the test region. SKUs listed in known_skus.yaml are discovered
+// globally (no location filter), so they may not be available in every region.
+func checkAvailability(tc *FamilyTestCase, availableSKUs sets.Set[string], region string) {
+	if tc.Result == resultSkipped {
+		return
+	}
+	if !availableSKUs.Has(tc.RepresentativeSize) {
+		tc.Result = resultSkipped
+		tc.Reason = fmt.Sprintf("SKU %s not available in region %s", tc.RepresentativeSize, region)
 	}
 }
 
