@@ -54,6 +54,11 @@ func (d *DefaultImageOutput) PopulateImageTraitsFromID(imageID string) {
 	}
 }
 
+// VirtualMachineImagesAPI retrieves regional marketplace image metadata.
+type VirtualMachineImagesAPI interface {
+	Get(ctx context.Context, location, publisherName, offer, skus, version string, options *armcomputev5.VirtualMachineImagesClientGetOptions) (armcomputev5.VirtualMachineImagesClientGetResponse, error)
+}
+
 // CommunityGalleryImageVersionsAPI is used for listing community gallery image versions.
 type CommunityGalleryImageVersionsAPI interface {
 	NewListPager(location string, publicGalleryName string, galleryImageName string, options *armcomputev5.CommunityGalleryImageVersionsClientListOptions) *runtime.Pager[armcomputev5.CommunityGalleryImageVersionsClientListResponse]

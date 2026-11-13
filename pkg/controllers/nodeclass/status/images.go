@@ -109,27 +109,18 @@ func (r *NodeImageReconciler) Register(_ context.Context, m manager.Manager) err
 // and clean approach while allowing us to extend future capabilities off of it. Additionally, while the decision to
 // store Requirements adds minor bloat, it also provides extra visibility into the avilaible images and how their
 // selection will work, which is seen as worth the tradeoff.
+//
+//nolint:gocyclo // Preserve the upstream reconciler structure.
 func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithName(nodeImageReconcilerName))
 	logger := log.FromContext(ctx)
 
-	// If marketplaceImage is set directly (e.g., OpenShift mode), use it as the only valid image.
-	// This bypasses the normal AKS image resolution.
-	if nodeClass.HasMarketplaceImage() {
-		directImage := v1beta1.NodeImage{
-			ID:           nodeClass.MarketplaceImageURN(),
-			Requirements: []corev1.NodeSelectorRequirement{},
-		}
-		nodeClass.Status.Images = []v1beta1.NodeImage{directImage}
-		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
-		logger.Info("using marketplace image from spec", "imageURN", nodeClass.MarketplaceImageURN())
-		return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
-	}
+	marketplace := nodeClass.HasMarketplaceImages()
 
 	// validate FIPS + useSIG
 	fipsMode := nodeClass.Spec.FIPSMode
 	useSIG := options.FromContext(ctx).UseSIG
-	if lo.FromPtr(fipsMode) == v1beta1.FIPSModeFIPS && !useSIG {
+	if !marketplace && lo.FromPtr(fipsMode) == v1beta1.FIPSModeFIPS && !useSIG {
 		nodeClass.Status.Images = nil
 		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "SIGRequiredForFIPS", "FIPS images require UseSIG to be enabled, but UseSIG is false (note: UseSIG is only supported in AKS managed NAP)")
 		logger.Info("FIPS images require SIG", "error", fmt.Errorf("FIPS images require UseSIG to be enabled, but UseSIG is false (note: UseSIG is only supported in AKS managed NAP)"))
@@ -138,6 +129,10 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 
 	nodeImages, err := r.nodeImageProvider.List(ctx, nodeClass)
 	if err != nil {
+		if marketplace {
+			nodeClass.Status.Images = nil
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "MarketplaceImagesResolutionFailed", err.Error())
+		}
 		return reconcile.Result{}, fmt.Errorf("getting nodeimages, %w", err)
 	}
 	goalImages := lo.Map(nodeImages, func(nodeImage imagefamily.NodeImage, _ int) v1beta1.NodeImage {
@@ -157,6 +152,17 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 			Requirements: reqs,
 		}
 	})
+
+	// Marketplace URNs are resolved directly and must not enter gallery version-preservation logic.
+	if marketplace {
+		nodeClass.Status.Images = goalImages
+		if len(goalImages) == 0 {
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "ImagesNotFound", "No marketplace images resolved")
+		} else {
+			nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
+		}
+		return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
 
 	// Scenario A: Check if we should do a full update to latest before processing any partial update
 	//

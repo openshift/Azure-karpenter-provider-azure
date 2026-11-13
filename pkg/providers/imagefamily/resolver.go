@@ -284,3 +284,39 @@ func (r *defaultResolver) ResolveNodeImageFromNodeClass(nodeClass *v1beta1.AKSNo
 	}
 	return "", fmt.Errorf("no compatible images found for instance type %s", instanceType.Name)
 }
+
+// ResolveMarketplaceImageFromNodeClass selects a resolved marketplace URN for an instance type.
+func ResolveMarketplaceImageFromNodeClass(nodeClass *v1beta1.AKSNodeClass, instanceType *cloudprovider.InstanceType) (string, error) {
+	images, err := nodeClass.GetImages()
+	if err != nil {
+		return "", err
+	}
+	for _, image := range images {
+		// Legacy status with no architecture must never match either architecture.
+		architecture := marketplaceImageArchitecture(image)
+		if architecture != karpv1.ArchitectureAmd64 && architecture != karpv1.ArchitectureArm64 {
+			continue
+		}
+		if !instanceType.Requirements.Has(corev1.LabelArchStable) || !instanceType.Requirements.Get(corev1.LabelArchStable).Has(architecture) {
+			continue
+		}
+		if err := instanceType.Requirements.Compatible(scheduling.NewNodeSelectorRequirements(image.Requirements...), v1beta1.AllowUndefinedWellKnownAndRestrictedLabels); err != nil {
+			continue
+		}
+		if _, err := v1beta1.ParseMarketplaceImageURN(image.ID); err != nil {
+			return "", err
+		}
+		return image.ID, nil
+	}
+	return "", fmt.Errorf("no compatible marketplace images found for instance type %s", instanceType.Name)
+}
+
+func marketplaceImageArchitecture(image v1beta1.NodeImage) string {
+	architecture := ""
+	for _, requirement := range image.Requirements {
+		if requirement.Key == corev1.LabelArchStable && requirement.Operator == corev1.NodeSelectorOpIn && len(requirement.Values) == 1 {
+			architecture = requirement.Values[0]
+		}
+	}
+	return architecture
+}

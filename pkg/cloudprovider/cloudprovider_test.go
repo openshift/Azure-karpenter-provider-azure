@@ -41,16 +41,16 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 	validNodeClass := func() *v1beta1.AKSNodeClass {
 		nc := test.AKSNodeClass(v1beta1.AKSNodeClass{
 			Spec: v1beta1.AKSNodeClassSpec{
-				MarketplaceImage: &v1beta1.MarketplaceImage{
-					Publisher: "azureopenshift",
-					Offer:     "aro4",
-					SKU:       "aro_422-v2",
-					Version:   "9.8.20260428",
-				},
-				UserData: lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
+				MarketplaceImages: []string{"azureopenshift:aro4:aro_422-v2:9.8.20260428"},
+				UserData:          lo.ToPtr("{\"ignition\":{\"version\":\"3.2.0\"}}"),
 			},
 		})
 		nc.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)
+		nc.Status.Images = []v1beta1.NodeImage{{
+			ID:           "azureopenshift:aro4:aro_422-v2:9.8.20260428",
+			Requirements: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}},
+		}}
+		nc.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
 		return nc
 	}
 
@@ -62,7 +62,7 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 		errMsg    string
 	}{
 		{
-			name:      "OpenShift mode accepts marketplaceImage and userData without AKS readiness",
+			name:      "OpenShift mode accepts resolved marketplaceImages and userData without AKS readiness",
 			ctx:       openShiftCtx,
 			nodeClass: validNodeClass(),
 			expectErr: false,
@@ -100,7 +100,7 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 			errMsg:    "SubnetsReady is in Ready=Unknown",
 		},
 		{
-			name: "OpenShift mode requires marketplaceImage",
+			name: "OpenShift mode requires marketplaceImages",
 			ctx:  openShiftCtx,
 			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
@@ -108,19 +108,14 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 				},
 			}),
 			expectErr: true,
-			errMsg:    "marketplaceImage is required in OpenShift mode",
+			errMsg:    "marketplaceImages is required in OpenShift mode",
 		},
 		{
 			name: "OpenShift mode requires userData",
 			ctx:  openShiftCtx,
 			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
-					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "azureopenshift",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
-					},
+					MarketplaceImages: []string{"azureopenshift:aro4:aro_422-v2:9.8.20260428"},
 				},
 			}),
 			expectErr: true,
@@ -131,13 +126,8 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 			ctx:  openShiftCtx,
 			nodeClass: test.AKSNodeClass(v1beta1.AKSNodeClass{
 				Spec: v1beta1.AKSNodeClassSpec{
-					MarketplaceImage: &v1beta1.MarketplaceImage{
-						Publisher: "azureopenshift",
-						Offer:     "aro4",
-						SKU:       "aro_422-v2",
-						Version:   "9.8.20260428",
-					},
-					UserData: lo.ToPtr(""),
+					MarketplaceImages: []string{"azureopenshift:aro4:aro_422-v2:9.8.20260428"},
+					UserData:          lo.ToPtr(""),
 				},
 			}),
 			expectErr: true,
@@ -146,6 +136,22 @@ func TestValidateNodeClassOpenShift(t *testing.T) {
 	}
 
 	cp := &CloudProvider{}
+	invalidStatus := map[string]func(*v1beta1.AKSNodeClass){
+		"unready images": func(nc *v1beta1.AKSNodeClass) {
+			nc.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "LookupFailed", "lookup failed")
+		},
+		"stale images":         func(nc *v1beta1.AKSNodeClass) { nc.Generation++ },
+		"empty images":         func(nc *v1beta1.AKSNodeClass) { nc.Status.Images = nil },
+		"unconstrained images": func(nc *v1beta1.AKSNodeClass) { nc.Status.Images[0].Requirements = nil },
+	}
+	for name, mutate := range invalidStatus {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			nc := validNodeClass()
+			mutate(nc)
+			g.Expect(cp.validateNodeClass(openShiftCtx, nc)).To(HaveOccurred())
+		})
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
