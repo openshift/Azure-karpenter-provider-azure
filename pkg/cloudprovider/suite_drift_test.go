@@ -17,6 +17,8 @@ limitations under the License.
 package cloudprovider
 
 import (
+	"strings"
+
 	"github.com/blang/semver/v4"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -302,6 +304,44 @@ var _ = Describe("CloudProvider", func() {
 					drifted, err := cloudProvider.IsDrifted(ctx, driftNodeClaim)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(drifted).To(BeEmpty())
+				})
+
+				Context("OpenShift Ignition userData", func() {
+					const userData = `{"ignition":{"version":"3.2.0","config":{"merge":[{"source":"https://example.com/ignition","httpHeaders":[{"name":"Authorization","value":"Bearer old-token"},{"name":"TargetConfigVersionHash","value":"config-v1"}]}]}}}`
+
+					BeforeEach(func() {
+						ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+							ProvisionMode:           lo.ToPtr(consts.ProvisionModeOpenShift),
+							KubeletIdentityClientID: lo.ToPtr(node.Labels[v1beta1.AKSLabelKubeletIdentityClientID]),
+						}))
+						nodeClass.Spec.UserData = lo.ToPtr(userData)
+						nodeClass.Spec.MarketplaceImage = &v1beta1.MarketplaceImage{
+							Publisher: "azureopenshift",
+							Offer:     "aro4",
+							SKU:       "aro_422-v2",
+							Version:   "9.8.20260428",
+						}
+						ExpectApplied(ctx, env.Client, nodeClass)
+						ExpectNodeClassHashUpdated(ctx, env.Client, nodeClass)
+						// Model a NodeClaim launched with this pinned config and image.
+						driftNodeClaim.Annotations[v1beta1.AnnotationAKSNodeClassHash] = nodeClass.Hash()
+						ExpectApplied(ctx, env.Client, driftNodeClaim)
+					})
+
+					DescribeTable("should drift only for config or image changes", func(updatedUserData, imageVersion string, expectedDrift string) {
+						nodeClass.Spec.UserData = lo.ToPtr(updatedUserData)
+						nodeClass.Spec.MarketplaceImage.Version = imageVersion
+						ExpectApplied(ctx, env.Client, nodeClass)
+						ExpectNodeClassHashUpdated(ctx, env.Client, nodeClass)
+
+						drifted, err := cloudProvider.IsDrifted(ctx, driftNodeClaim)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(string(drifted)).To(Equal(expectedDrift))
+					},
+						Entry("token rotation on a pinned NodeClass", strings.ReplaceAll(userData, "old-token", "new-token"), "9.8.20260428", string(NoDrift)),
+						Entry("target config version change", strings.ReplaceAll(userData, "config-v1", "config-v2"), "9.8.20260428", string(NodeClassDrift)),
+						Entry("marketplace image version change", userData, "9.8.20260429", string(NodeClassDrift)),
+					)
 				})
 
 				It("should trigger drift if NodeClass subnet changed", func() {
