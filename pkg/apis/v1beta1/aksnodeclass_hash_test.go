@@ -17,6 +17,8 @@ limitations under the License.
 package v1beta1_test
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"dario.cat/mergo"
@@ -125,6 +127,55 @@ var _ = Describe("Hash", func() {
 		}
 		Expect(nodeClass.Hash()).To(Equal(otherNodeClass.Hash()))
 	})
+	Context("Ignition userData", func() {
+		const userData = `{"ignition":{"version":"3.2.0","config":{"merge":[{"source":"https://example.com/ignition","httpHeaders":[{"name":"Authorization","value":"Bearer old-token"},{"name":"TargetConfigVersionHash","value":"config-v1"}]}]}}}`
+
+		BeforeEach(func() {
+			nodeClass.Spec.UserData = lo.ToPtr(userData)
+		})
+
+		It("should use the target config version without modifying userData", func() {
+			expected := nodeClass.DeepCopy()
+			expected.Spec.UserData = lo.ToPtr("config-v1")
+			Expect(nodeClass.UserDataHash()).To(Equal(lo.ToPtr("config-v1")))
+			Expect(nodeClass.Hash()).To(Equal(expected.Hash()))
+			Expect(nodeClass.Spec.UserData).To(Equal(lo.ToPtr(userData)))
+		})
+
+		It("should not change hash when only the bearer token rotates", func() {
+			hash := nodeClass.Hash()
+			nodeClass.Spec.UserData = lo.ToPtr(strings.ReplaceAll(userData, "old-token", "new-token"))
+			Expect(nodeClass.Hash()).To(Equal(hash))
+		})
+
+		It("should change hash when the target config version changes", func() {
+			hash := nodeClass.Hash()
+			nodeClass.Spec.UserData = lo.ToPtr(strings.ReplaceAll(userData, "config-v1", "config-v2"))
+			Expect(nodeClass.Hash()).ToNot(Equal(hash))
+		})
+
+		DescribeTable("should fall back to raw userData", func(userData *string) {
+			nodeClass.Spec.UserData = userData
+			Expect(nodeClass.UserDataHash()).To(Equal(userData))
+			if userData != nil {
+				hash := nodeClass.Hash()
+				nodeClass.Spec.UserData = lo.ToPtr(*userData + "\n")
+				Expect(nodeClass.Hash()).ToNot(Equal(hash))
+			}
+		},
+			Entry("nil", nil),
+			Entry("empty", lo.ToPtr("")),
+			Entry("non-Ignition data", lo.ToPtr("#!/bin/bash\necho hello")),
+			Entry("malformed JSON", lo.ToPtr(`{"ignition":`)),
+			Entry("no merge sources", lo.ToPtr(`{"ignition":{"version":"3.2.0"}}`)),
+			Entry("empty merge sources", lo.ToPtr(`{"ignition":{"config":{"merge":[]}}}`)),
+			Entry("no target config version", lo.ToPtr(strings.ReplaceAll(userData, "TargetConfigVersionHash", "OtherHeader"))),
+			Entry("null target config version", lo.ToPtr(strings.ReplaceAll(userData, `"config-v1"`, "null"))),
+			Entry("invalid header value type", lo.ToPtr(strings.ReplaceAll(userData, `"config-v1"`, "123"))),
+			Entry("target config version only on a later merge source", lo.ToPtr(fmt.Sprintf(`{"ignition":{"config":{"merge":[{}, {"httpHeaders":[{"name":%q,"value":"config-v1"}]}]}}}`, v1beta1.TargetConfigVersionHashHeader))),
+		)
+	})
+
 	// This test is a sanity check to update the hashing version if the algorithm has been updated.
 	// Note: this will only catch a missing version update, if the staticHash hasn't been updated yet.
 	It("when hashing algorithm updates, we should update the hash version", func() {

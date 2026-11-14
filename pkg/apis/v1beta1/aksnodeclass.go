@@ -17,6 +17,7 @@ limitations under the License.
 package v1beta1
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/mitchellh/hashstructure/v2"
@@ -723,11 +724,49 @@ type AKSNodeClass struct {
 const AKSNodeClassHashVersion = "v3"
 
 func (in *AKSNodeClass) Hash() string {
-	return fmt.Sprint(lo.Must(hashstructure.Hash(in.Spec, hashstructure.FormatV2, &hashstructure.HashOptions{
+	spec := in.Spec
+	spec.UserData = in.UserDataHash()
+	return fmt.Sprint(lo.Must(hashstructure.Hash(spec, hashstructure.FormatV2, &hashstructure.HashOptions{
 		SlicesAsSets:    true,
 		IgnoreZeroValue: true,
 		ZeroNil:         true,
 	})))
+}
+
+// UPSTREAM: <carry>: HyperShift stamps this header with the effective Ignition
+// config version. Unlike the bearer token, it changes only when nodes need a rollout.
+const TargetConfigVersionHashHeader = "TargetConfigVersionHash"
+
+// UserDataHash returns HyperShift's target config version from the first Ignition
+// merge source, or the raw userData when that header cannot be read.
+func (in *AKSNodeClass) UserDataHash() *string {
+	if in.Spec.UserData == nil {
+		return nil
+	}
+	var ignitionConfig struct {
+		Ignition struct {
+			Config struct {
+				Merge []struct {
+					HTTPHeaders []struct {
+						Name  string  `json:"name"`
+						Value *string `json:"value"`
+					} `json:"httpHeaders"`
+				} `json:"merge"`
+			} `json:"config"`
+		} `json:"ignition"`
+	}
+	if err := json.Unmarshal([]byte(*in.Spec.UserData), &ignitionConfig); err != nil {
+		return in.Spec.UserData
+	}
+	if len(ignitionConfig.Ignition.Config.Merge) == 0 {
+		return in.Spec.UserData
+	}
+	for _, header := range ignitionConfig.Ignition.Config.Merge[0].HTTPHeaders {
+		if header.Name == TargetConfigVersionHashHeader && header.Value != nil {
+			return header.Value
+		}
+	}
+	return in.Spec.UserData
 }
 
 // AKSNodeClassList contains a list of AKSNodeClass
