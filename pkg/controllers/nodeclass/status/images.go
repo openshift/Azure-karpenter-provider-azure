@@ -91,7 +91,7 @@ func (r *NodeImageReconciler) Register(_ context.Context, m manager.Manager) err
 		Complete(reconcile.AsReconciler(m.GetClient(), r))
 }
 
-// The image version reconciler will detect reasons to bump the node image version as follows in order:
+// Gallery image versions are reconciled as follows; marketplace images are resolved separately.
 //
 // Scenario A: Update all image versions to latest
 //   - 1. Initializes the images versions for a newly created AKSNodeClass, based on customer configuration.
@@ -113,17 +113,8 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithName(nodeImageReconcilerName))
 	logger := log.FromContext(ctx)
 
-	// If marketplaceImage is set directly (e.g., OpenShift mode), use it as the only valid image.
-	// This bypasses the normal AKS image resolution.
-	if nodeClass.HasMarketplaceImage() {
-		directImage := v1beta1.NodeImage{
-			ID:           nodeClass.MarketplaceImageURN(),
-			Requirements: []corev1.NodeSelectorRequirement{},
-		}
-		nodeClass.Status.Images = []v1beta1.NodeImage{directImage}
-		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
-		logger.Info("using marketplace image from spec", "imageURN", nodeClass.MarketplaceImageURN())
-		return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
+	if nodeClass.HasMarketplaceImages() {
+		return r.reconcileMarketplace(ctx, nodeClass)
 	}
 
 	// validate FIPS + useSIG
@@ -140,23 +131,7 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("getting nodeimages, %w", err)
 	}
-	goalImages := lo.Map(nodeImages, func(nodeImage imagefamily.NodeImage, _ int) v1beta1.NodeImage {
-		reqs := lo.Map(nodeImage.Requirements.NodeSelectorRequirements(), func(item v1.NodeSelectorRequirementWithMinValues, _ int) corev1.NodeSelectorRequirement {
-			return corev1.NodeSelectorRequirement{Key: item.Key, Operator: item.Operator, Values: item.Values}
-		})
-
-		// sorted for consistency
-		sort.Slice(reqs, func(i, j int) bool {
-			if len(reqs[i].Key) != len(reqs[j].Key) {
-				return len(reqs[i].Key) < len(reqs[j].Key)
-			}
-			return reqs[i].Key < reqs[j].Key
-		})
-		return v1beta1.NodeImage{
-			ID:           nodeImage.ID,
-			Requirements: reqs,
-		}
-	})
+	goalImages := toStatusNodeImages(nodeImages)
 
 	// Scenario A: Check if we should do a full update to latest before processing any partial update
 	//
@@ -190,6 +165,43 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	nodeClass.Status.Images = goalImages
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
 	return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+func (r *NodeImageReconciler) reconcileMarketplace(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
+	nodeImages, err := r.nodeImageProvider.List(ctx, nodeClass)
+	if err != nil {
+		nodeClass.Status.Images = nil
+		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "MarketplaceImagesResolutionFailed", err.Error())
+		return reconcile.Result{}, fmt.Errorf("getting nodeimages, %w", err)
+	}
+	goalImages := toStatusNodeImages(nodeImages)
+	nodeClass.Status.Images = goalImages
+	if len(goalImages) == 0 {
+		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "ImagesNotFound", "No marketplace images resolved")
+	} else {
+		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
+	}
+	return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+func toStatusNodeImages(nodeImages []imagefamily.NodeImage) []v1beta1.NodeImage {
+	return lo.Map(nodeImages, func(nodeImage imagefamily.NodeImage, _ int) v1beta1.NodeImage {
+		reqs := lo.Map(nodeImage.Requirements.NodeSelectorRequirements(), func(item v1.NodeSelectorRequirementWithMinValues, _ int) corev1.NodeSelectorRequirement {
+			return corev1.NodeSelectorRequirement{Key: item.Key, Operator: item.Operator, Values: item.Values}
+		})
+
+		// sorted for consistency
+		sort.Slice(reqs, func(i, j int) bool {
+			if len(reqs[i].Key) != len(reqs[j].Key) {
+				return len(reqs[i].Key) < len(reqs[j].Key)
+			}
+			return reqs[i].Key < reqs[j].Key
+		})
+		return v1beta1.NodeImage{
+			ID:           nodeImage.ID,
+			Requirements: reqs,
+		}
+	})
 }
 
 // Handles case 1: This is a new AKSNodeClass, where images haven't been populated yet

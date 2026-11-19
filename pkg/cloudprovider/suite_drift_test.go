@@ -315,12 +315,7 @@ var _ = Describe("CloudProvider", func() {
 							KubeletIdentityClientID: lo.ToPtr(node.Labels[v1beta1.AKSLabelKubeletIdentityClientID]),
 						}))
 						nodeClass.Spec.UserData = lo.ToPtr(userData)
-						nodeClass.Spec.MarketplaceImage = &v1beta1.MarketplaceImage{
-							Publisher: "azureopenshift",
-							Offer:     "aro4",
-							SKU:       "aro_422-v2",
-							Version:   "9.8.20260428",
-						}
+						nodeClass.Spec.MarketplaceImages = []string{"azureopenshift:aro4:aro_422-v2:9.8.20260428"}
 						ExpectApplied(ctx, env.Client, nodeClass)
 						ExpectNodeClassHashUpdated(ctx, env.Client, nodeClass)
 						// Model a NodeClaim launched with this pinned config and image.
@@ -330,7 +325,7 @@ var _ = Describe("CloudProvider", func() {
 
 					DescribeTable("should drift only for config or image changes", func(updatedUserData, imageVersion string, expectedDrift string) {
 						nodeClass.Spec.UserData = lo.ToPtr(updatedUserData)
-						nodeClass.Spec.MarketplaceImage.Version = imageVersion
+						nodeClass.Spec.MarketplaceImages[0] = "azureopenshift:aro4:aro_422-v2:" + imageVersion
 						ExpectApplied(ctx, env.Client, nodeClass)
 						ExpectNodeClassHashUpdated(ctx, env.Client, nodeClass)
 

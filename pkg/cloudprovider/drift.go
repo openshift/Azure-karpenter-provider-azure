@@ -118,7 +118,7 @@ func (c *CloudProvider) areStaticFieldsDrifted(ctx context.Context, nodeClaim *k
 func (c *CloudProvider) isK8sVersionDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
 	logger := log.FromContext(ctx)
 
-	// OpenShift nodes get their release from spec.marketplaceImage and spec.userData, which are part of the
+	// OpenShift nodes get their release from spec.marketplaceImages and spec.userData, which are part of the
 	// NodeClass hash. A kubelet version that differs from the control plane's is expected and is not drift.
 	if options.FromContext(ctx).ProvisionMode == consts.ProvisionModeOpenShift {
 		return "", nil

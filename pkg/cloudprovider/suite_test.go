@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 	"github.com/awslabs/operatorpkg/object"
 	. "github.com/onsi/ginkgo/v2"
@@ -393,6 +394,161 @@ var _ = Describe("CloudProvider", func() {
 				})
 			})
 		})
+	})
+
+	Context("MarketplaceImages", func() {
+		BeforeEach(func() {
+			testOptions = test.Options(test.OptionsFields{
+				ProvisionMode:             lo.ToPtr(consts.ProvisionModeOpenShift),
+				ManageExistingAKSMachines: lo.ToPtr(false),
+			})
+			ctx = coreoptions.ToContext(ctx, coretest.Options())
+			ctx = options.ToContext(ctx, testOptions)
+			azureEnv = test.NewEnvironment(ctx, env)
+			test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
+			nodeClass.Spec.MarketplaceImages = []string{"publisher:offer:amd64:1.0.0", "publisher:offer:arm64:1.0.0"}
+			nodeClass.Spec.UserData = lo.ToPtr(`{"ignition":{"version":"3.2.0"}}`)
+			nodeClass.Status.Images = []v1beta1.NodeImage{
+				{ID: "publisher:offer:amd64:1.0.0", Requirements: []v1.NodeSelectorRequirement{
+					{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{"amd64"}},
+					{Key: v1beta1.LabelSKUHyperVGeneration, Operator: v1.NodeSelectorOpIn, Values: []string{"2"}},
+				}},
+				{ID: "publisher:offer:arm64:1.0.0", Requirements: []v1.NodeSelectorRequirement{
+					{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{"arm64"}},
+					{Key: v1beta1.LabelSKUHyperVGeneration, Operator: v1.NodeSelectorOpIn, Values: []string{"2"}},
+				}},
+			}
+			nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
+			cloudProvider = New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore)
+			cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
+			coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
+		})
+		AfterEach(func() {
+			cloudProvider.WaitForInstancePromises()
+			cluster.Reset()
+			azureEnv.Reset(ctx)
+		})
+		It("excludes Gen1-only sizes from scheduling with a Gen2 marketplace image", func() {
+			nodeClass.Status.Images = nodeClass.Status.Images[:1]
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+			types, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+			Expect(err).NotTo(HaveOccurred(), "listing instance types for a Gen2 marketplace image")
+			names := lo.Map(types, func(instanceType *corecloudprovider.InstanceType, _ int) string { return instanceType.Name })
+			Expect(names).NotTo(ContainElement("Standard_D2_v2"), "Gen1-only size must be excluded")
+			Expect(names).To(ContainElements("Standard_D2as_v6", "Standard_D2s_v3"), "Gen2-only and dual-generation sizes remain eligible")
+		})
+		DescribeTable("checks marketplace image generation before creating a VM", func(size string, compatible bool) {
+			nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: v1.LabelInstanceTypeStable, Operator: v1.NodeSelectorOpIn, Values: []string{size}}}
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+			if !compatible {
+				Expect(corecloudprovider.IsInsufficientCapacityError(err)).To(BeTrue(), "Gen1-only size cannot launch a Gen2 image")
+				Expect(created).To(BeNil())
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+				return
+			}
+			Expect(err).NotTo(HaveOccurred(), "creating a VM with a compatible marketplace image")
+			Expect(created.Labels[v1.LabelInstanceTypeStable]).To(Equal(size))
+			Expect(created.Status.ImageID).To(Equal("publisher:offer:amd64:1.0.0"))
+			Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+		},
+			Entry("rejects a Gen1-only size", "Standard_D2_v2", false),
+			Entry("accepts a Gen2-only size", "Standard_D2as_v6", true),
+			Entry("accepts a dual-generation size", "Standard_D2s_v3", true),
+		)
+		It("filters scheduling and creation to ARM64 when only ARM64 has an image", func() {
+			nodeClass.Status.Images = nodeClass.Status.Images[1:]
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+			types, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(types).NotTo(BeEmpty())
+			for _, instanceType := range types {
+				Expect(instanceType.Requirements.Get(v1.LabelArchStable).Values()).To(Equal([]string{"arm64"}))
+			}
+			// The normal scheduler must not choose the smaller, cheaper AMD64 candidate.
+			pod := coretest.UnschedulablePod()
+			ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+			Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+			vm := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+			Expect(vm.Properties.StorageProfile.ImageReference.SKU).To(HaveValue(Equal("arm64")))
+		})
+		DescribeTable("launches the image matching the selected architecture", func(arch, sku, version string, reversed bool) {
+			if reversed {
+				nodeClass.Status.Images[0], nodeClass.Status.Images[1] = nodeClass.Status.Images[1], nodeClass.Status.Images[0]
+			}
+			nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{arch}}}
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(created.Labels[v1.LabelArchStable]).To(Equal(arch))
+			Expect(created.Status.ImageID).To(Equal("publisher:offer:" + sku + ":" + version))
+			vm := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+			Expect(vm.Properties.StorageProfile.ImageReference).To(Equal(&armcompute.ImageReference{
+				Publisher: lo.ToPtr("publisher"), Offer: lo.ToPtr("offer"), SKU: lo.ToPtr(sku), Version: lo.ToPtr(version),
+			}))
+		},
+			Entry("AMD64", "amd64", "amd64", "1.0.0", false),
+			Entry("ARM64", "arm64", "arm64", "1.0.0", false),
+			Entry("AMD64 reversed", "amd64", "amd64", "1.0.0", true),
+			Entry("ARM64 reversed", "arm64", "arm64", "1.0.0", true),
+		)
+		It("reads the selected URN from status rather than same-generation spec", func() {
+			nodeClass.Status.Images[0].ID = "resolved:status:amd64:2.0.0"
+			nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{"amd64"}}}
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(created.Status.ImageID).To(Equal("resolved:status:amd64:2.0.0"))
+			vm := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+			Expect(vm.Properties.StorageProfile.ImageReference.Publisher).To(HaveValue(Equal("resolved")))
+			Expect(vm.Properties.StorageProfile.ImageReference.Offer).To(HaveValue(Equal("status")))
+			Expect(vm.Properties.StorageProfile.ImageReference.Version).To(HaveValue(Equal("2.0.0")))
+		})
+		It("rejects creation when no compatible candidate has an image", func() {
+			nodeClass.Status.Images = nodeClass.Status.Images[1:]
+			nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{"amd64"}}}
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+			Expect(corecloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
+			Expect(created).To(BeNil())
+			Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+		})
+		DescribeTable("rejects invalid image status without creating a VM", func(mutate func(*v1beta1.AKSNodeClass)) {
+			mutate(nodeClass)
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+			Expect(err).To(HaveOccurred())
+			Expect(created).To(BeNil())
+			Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+		},
+			Entry("empty", func(n *v1beta1.AKSNodeClass) { n.Status.Images = nil }),
+			Entry("unready", func(n *v1beta1.AKSNodeClass) {
+				n.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "Failed", "lookup failed")
+			}),
+			Entry("unconstrained", func(n *v1beta1.AKSNodeClass) {
+				n.Status.Images = []v1beta1.NodeImage{{ID: "publisher:offer:amd64:1.0.0", Requirements: []v1.NodeSelectorRequirement{}}}
+			}),
+		)
+		It("reconstructs an existing VM after its architecture loses image coverage", func() {
+			nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{"amd64"}}}
+			ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+			created, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, nodeClaim)
+			Expect(err).NotTo(HaveOccurred())
+			nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+			nodeClass.Status.Images = nodeClass.Status.Images[1:]
+			ExpectApplied(ctx, env.Client, nodeClass)
+			reconstructed, err := cloudProvider.Get(ctx, created.Status.ProviderID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reconstructed.Labels[v1.LabelInstanceTypeStable]).To(Equal(created.Labels[v1.LabelInstanceTypeStable]))
+			Expect(reconstructed.Labels[v1.LabelArchStable]).To(Equal("amd64"))
+			Expect(reconstructed.Status.Capacity).To(Equal(created.Status.Capacity))
+			listed, err := cloudProvider.List(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(listed).To(HaveLen(1))
+			Expect(listed[0].Labels[v1.LabelInstanceTypeStable]).To(Equal(created.Labels[v1.LabelInstanceTypeStable]))
+		})
+		runNodeOverlayCapacityTests(vmNodeOverlayCapacityTestOptions())
 	})
 
 	Context("ProvisionMode = AKSScriptless, ManageExistingAKSMachines = true", func() {

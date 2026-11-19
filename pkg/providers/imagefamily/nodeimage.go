@@ -29,6 +29,7 @@ import (
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -37,6 +38,7 @@ import (
 const (
 	ImageExpirationInterval    = time.Hour * 24 * 3
 	ImageCacheCleaningInterval = time.Hour * 1
+	marketplaceImageCacheTTL   = 5 * time.Minute
 
 	sharedImageGalleryImageIDFormat = "/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/galleries/%s/images/%s/versions/%s"
 	communityImageIDFormat          = "/CommunityGalleries/%s/images/%s/versions/%s"
@@ -55,26 +57,31 @@ type provider struct {
 	subscription string
 	location     string
 
-	imageVersionsClient types.CommunityGalleryImageVersionsAPI
-	nodeImageVersions   types.NodeImageVersionsAPI
+	imageVersionsClient     types.CommunityGalleryImageVersionsAPI
+	marketplaceImagesClient types.VirtualMachineImagesAPI
+	nodeImageVersions       types.NodeImageVersionsAPI
 
 	nodeImagesCache *cache.Cache
 	cm              *pretty.ChangeMonitor
 }
 
-func NewProvider(versionsClient types.CommunityGalleryImageVersionsAPI, location, subscription string, nodeImageVersionsClient types.NodeImageVersionsAPI, nodeImagesCache *cache.Cache) *provider {
+func NewProvider(versionsClient types.CommunityGalleryImageVersionsAPI, marketplaceImagesClient types.VirtualMachineImagesAPI, location, subscription string, nodeImageVersionsClient types.NodeImageVersionsAPI, nodeImagesCache *cache.Cache) *provider {
 	return &provider{
-		subscription:        subscription,
-		location:            location,
-		imageVersionsClient: versionsClient,
-		nodeImageVersions:   nodeImageVersionsClient,
-		nodeImagesCache:     nodeImagesCache,
-		cm:                  pretty.NewChangeMonitor(),
+		subscription:            subscription,
+		location:                location,
+		imageVersionsClient:     versionsClient,
+		marketplaceImagesClient: marketplaceImagesClient,
+		nodeImageVersions:       nodeImageVersionsClient,
+		nodeImagesCache:         nodeImagesCache,
+		cm:                      pretty.NewChangeMonitor(),
 	}
 }
 
 // Returns the list of available NodeImages for the given AKSNodeClass sorted in priority ordering
 func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]NodeImage, error) {
+	if nodeClass.HasMarketplaceImages() {
+		return p.listMarketplace(ctx, nodeClass.Spec.MarketplaceImages)
+	}
 	// TODO: refactor to be part of construction, since this is a karpenter setting and won't change across the process.
 	useSIG := options.FromContext(ctx).UseSIG
 
@@ -119,6 +126,66 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	p.nodeImagesCache.Set(key, nodeImages, cache.DefaultExpiration)
 
 	return nodeImages, nil
+}
+
+//nolint:gocyclo // Image lookup and metadata validation need explicit failure paths.
+func (p *provider) listMarketplace(ctx context.Context, urns []string) ([]NodeImage, error) {
+	images := make([]NodeImage, 0, len(urns))
+	architectures := map[string]bool{}
+	for _, urn := range urns {
+		image, err := v1beta1.ParseMarketplaceImageURN(urn)
+		if err != nil {
+			return nil, err
+		}
+		key := "marketplace:" + p.location + ":" + urn
+		if cached, ok := p.nodeImagesCache.Get(key); ok {
+			nodeImage := cached.(NodeImage)
+			arch := nodeImage.Requirements.Get(corev1.LabelArchStable).Any()
+			if architectures[arch] {
+				return nil, fmt.Errorf("multiple marketplace images resolve to architecture %q", arch)
+			}
+			architectures[arch] = true
+			images = append(images, nodeImage)
+			continue
+		}
+		response, err := p.marketplaceImagesClient.Get(ctx, p.location, image.Publisher, image.Offer, image.SKU, image.Version, nil)
+		if err != nil {
+			return nil, fmt.Errorf("getting marketplace image %q, %w", urn, err)
+		}
+		if response.Properties == nil || response.Properties.Architecture == nil {
+			return nil, fmt.Errorf("marketplace image %q has no architecture metadata", urn)
+		}
+		arch, ok := v1beta1.AzureToKubeArchitectures[string(*response.Properties.Architecture)]
+		if !ok {
+			return nil, fmt.Errorf("marketplace image %q has unsupported architecture %q", urn, *response.Properties.Architecture)
+		}
+		if response.Properties.HyperVGeneration == nil {
+			return nil, fmt.Errorf("marketplace image %q has no Hyper-V generation metadata", urn)
+		}
+		var generation string
+		switch *response.Properties.HyperVGeneration {
+		case armcompute.HyperVGenerationTypesV1:
+			generation = v1beta1.HyperVGenerationV1
+		case armcompute.HyperVGenerationTypesV2:
+			generation = v1beta1.HyperVGenerationV2
+		default:
+			return nil, fmt.Errorf("marketplace image %q has unsupported Hyper-V generation %q", urn, *response.Properties.HyperVGeneration)
+		}
+		if architectures[arch] {
+			return nil, fmt.Errorf("multiple marketplace images resolve to architecture %q", arch)
+		}
+		architectures[arch] = true
+		nodeImage := NodeImage{
+			ID: urn,
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, arch),
+				scheduling.NewRequirement(v1beta1.LabelSKUHyperVGeneration, corev1.NodeSelectorOpIn, generation),
+			),
+		}
+		p.nodeImagesCache.Set(key, nodeImage, marketplaceImageCacheTTL)
+		images = append(images, nodeImage)
+	}
+	return images, nil
 }
 
 func (p *provider) listSIG(ctx context.Context, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {
