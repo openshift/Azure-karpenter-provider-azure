@@ -17,7 +17,9 @@ limitations under the License.
 package v1beta1_test
 
 import (
+	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
@@ -28,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -95,6 +98,36 @@ var _ = Describe("CEL/Validation", func() {
 		}
 	})
 	Context("Kubelet overrides", func() {
+		DescribeTable("should omit a zero CPU quota period and preserve a configured period", func(period time.Duration, wantSerialized bool, wantPeriod time.Duration) {
+			nodeClass := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec: v1beta1.AKSNodeClassSpec{Kubelet: &v1beta1.KubeletConfiguration{
+					CPUCFSQuotaPeriod: metav1.Duration{Duration: period},
+				}},
+			}
+			data, err := json.Marshal(nodeClass)
+			Expect(err).NotTo(HaveOccurred())
+			var serialized map[string]any
+			Expect(json.Unmarshal(data, &serialized)).To(Succeed())
+			_, found, err := unstructured.NestedString(serialized, "spec", "kubelet", "cpuCFSQuotaPeriod")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(Equal(wantSerialized))
+
+			converted, err := runtime.DefaultUnstructuredConverter.ToUnstructured(nodeClass)
+			Expect(err).NotTo(HaveOccurred())
+			_, found, err = unstructured.NestedString(converted, "spec", "kubelet", "cpuCFSQuotaPeriod")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(Equal(wantSerialized))
+
+			Expect(env.Client.Create(ctx, nodeClass)).To(Succeed())
+			persisted := &v1beta1.AKSNodeClass{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClass), persisted)).To(Succeed())
+			Expect(persisted.Spec.Kubelet.CPUCFSQuotaPeriod.Duration).To(Equal(wantPeriod))
+		},
+			Entry("When the period is zero, it should omit the field and receive the CRD default", time.Duration(0), false, 100*time.Millisecond),
+			Entry("When the period is configured, it should preserve the value", 250*time.Millisecond, true, 250*time.Millisecond),
+		)
+
 		DescribeTable("should validate kubeReserved", func(kubeReserved *v1beta1.KubeReserved, expected bool) {
 			nodeClass := &v1beta1.AKSNodeClass{
 				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},

@@ -611,7 +611,7 @@ type KubeletConfiguration struct {
 	// +default="100ms"
 	// TODO: validation
 	//nolint:kubeapilinter // nodurations: using Duration for compatibility with upstream kubelet types
-	CPUCFSQuotaPeriod metav1.Duration `json:"cpuCFSQuotaPeriod,omitempty"`
+	CPUCFSQuotaPeriod metav1.Duration `json:"cpuCFSQuotaPeriod,omitzero"`
 	// imageGCHighThresholdPercent is the percent of disk usage after which image
 	// garbage collection is always run. The percent is calculated by dividing this
 	// field value by 100, so this field must be between 0 and 100, inclusive.
